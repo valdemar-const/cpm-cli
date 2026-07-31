@@ -102,6 +102,9 @@ enum Cmd {
         /// Patch root (relative to project root).
         #[arg(long, default_value = "build/patches")]
         patches: String,
+        /// Overwrite existing files (default: keep them).
+        #[arg(long)]
+        force: bool,
     },
     /// (Re)generate Find<Name>.cmake + fallback registrations from deps.toml.
     Generate {
@@ -143,8 +146,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Update { global, check } => bootstrap::update(global, check),
         Cmd::Env { export } => commands::env(export),
         Cmd::Verify { target } => commands::verify(&target),
-        Cmd::Init { project, dir, scripts, patches } => {
-            gen::init(&project, &dir, &scripts, &patches)
+        Cmd::Init { project, dir, scripts, patches, force } => {
+            gen::init(&project, &dir, &scripts, &patches, force)
         }
         Cmd::Generate { project, dir } => gen::generate(&project, &dir),
     }
