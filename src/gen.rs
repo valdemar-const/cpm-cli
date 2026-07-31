@@ -454,6 +454,14 @@ fn find_key_for_package(manifest: &Manifest, pkg: &str) -> String {
     pkg.to_string()
 }
 
+/// A `pre`/`post` value is a file reference (passed through to the engine
+/// verbatim) when it is a single line ending in `.cmake`; otherwise it is inline
+/// CMake code, written to a generated `pre_<key>.cmake`/`post_<key>.cmake`.
+fn is_hook_file_ref(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty() && !t.contains('\n') && t.to_ascii_lowercase().ends_with(".cmake")
+}
+
 fn write_hooks(
     dir: &Path,
     key: &str,
@@ -462,17 +470,25 @@ fn write_hooks(
 ) -> Result<(Option<String>, Option<String>)> {
     let pre_file = match pre {
         Some(s) if !s.trim().is_empty() => {
-            let f = format!("pre_{key}.cmake");
-            std::fs::write(dir.join(&f), format!("# pre[{key}] — generated\n{s}\n"))?;
-            Some(f)
+            if is_hook_file_ref(s) {
+                Some(s.trim().to_string())
+            } else {
+                let f = format!("pre_{key}.cmake");
+                std::fs::write(dir.join(&f), format!("# pre[{key}] — generated\n{s}\n"))?;
+                Some(f)
+            }
         }
         _ => None,
     };
     let post_file = match post {
         Some(s) if !s.trim().is_empty() => {
-            let f = format!("post_{key}.cmake");
-            std::fs::write(dir.join(&f), format!("# post[{key}] — generated\n{s}\n"))?;
-            Some(f)
+            if is_hook_file_ref(s) {
+                Some(s.trim().to_string())
+            } else {
+                let f = format!("post_{key}.cmake");
+                std::fs::write(dir.join(&f), format!("# post[{key}] — generated\n{s}\n"))?;
+                Some(f)
+            }
         }
         _ => None,
     };
@@ -595,5 +611,17 @@ mod tests {
     #[test]
     fn subst_version_works() {
         assert_eq!(subst_version("v.${version}", &Some("3.5.2".into())), "v.3.5.2");
+    }
+
+    #[test]
+    fn hook_file_ref_detection() {
+        // file references
+        assert!(is_hook_file_ref("my_post.cmake"));
+        assert!(is_hook_file_ref("${CMAKE_CURRENT_LIST_DIR}/sub/my.cmake"));
+        assert!(is_hook_file_ref("/abs/path/my.cmake"));
+        // inline code is not
+        assert!(!is_hook_file_ref("add_library(foo INTERFACE)"));
+        assert!(!is_hook_file_ref("if(NOT TARGET foo)\n  add_library(foo)\nendif()"));
+        assert!(!is_hook_file_ref(""));
     }
 }

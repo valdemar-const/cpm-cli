@@ -24,6 +24,19 @@ set(CPM_PATCH_PREFIX "${PROJECT_SOURCE_DIR}/build/patches" CACHE PATH
     "cpm: root directory of patch files (looked up as <CPM_PATCH_PREFIX>/<archive-base>/<name>.patch)")
 
 # ---- package-level declaration ---------------------------------------------
+#
+# Include a PRE/POST hook: a plain filename is resolved under the module dir; an
+# absolute path (or an already-expanded ${CMAKE_CURRENT_LIST_DIR}/...) is used as-is.
+function(cpm_include_hook _h)
+  if(NOT "${_h}" STREQUAL "")
+    if(IS_ABSOLUTE "${_h}")
+      include("${_h}" OPTIONAL)
+    else()
+      include("${CMAKE_CURRENT_LIST_DIR}/${_h}" OPTIONAL)
+    endif()
+  endif()
+endfunction()
+
 function(cpm_declare_package)
   cmake_parse_arguments(ARG "" "KEY;PACKAGE;VERSION;PRE;POST" "OPTIONS;ALIASES" ${ARGN})
   set_property(GLOBAL PROPERTY "CPM_PKG_NAME_${ARG_KEY}"    "${ARG_PACKAGE}")
@@ -64,7 +77,7 @@ function(cpm_resolve_fallback key)
   get_property(_n       GLOBAL PROPERTY "CPM_FB_${key}_N")
 
   if(NOT (_pre STREQUAL ""))
-    include("${CMAKE_CURRENT_LIST_DIR}/${_pre}" OPTIONAL)
+    cpm_include_hook("${_pre}")
   endif()
 
   set(_ok FALSE)
@@ -163,7 +176,7 @@ function(cpm_resolve_fallback key)
       endif()
     endforeach()
     if(NOT (_post STREQUAL ""))
-      include("${CMAKE_CURRENT_LIST_DIR}/${_post}" OPTIONAL)
+      cpm_include_hook("${_post}")
     endif()
     set(${_pkg}_FOUND TRUE PARENT_SCOPE)
   else()
