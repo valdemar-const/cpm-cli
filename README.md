@@ -145,11 +145,11 @@ fully-defaulted `[dep.X]` stanza into `deps.toml` (with a commented menu of ever
 optional override), and regenerates the glue in one shot:
 
 ```sh
-cpm requires fmt            # freshest available
-cpm requires boost "^1.85"  # constraint: resolve to the freshest matching version
-cpm requires glm 1.0.1      # exact pin (a bare version is always exact)
-cpm requires --list         # show every required dep + its resolved version
-cpm requires --rm glad      # drop one
+cpm requires add fmt            # freshest available
+cpm requires add boost "^1.85"  # constraint: resolve to the freshest matching version
+cpm requires add glm 1.0.1      # exact pin (a bare version is always exact)
+cpm requires list               # show every required dep + its resolved version
+cpm requires rm glad            # drop one
 ```
 
 The version spec grammar:
@@ -162,12 +162,13 @@ The version spec grammar:
 | `>=1.85 <2.0`     | comparators (space- or comma-separated)                     |
 | `*` / omitted     | freshest in the pantry                                      |
 
-Bump a dep's version without touching its other settings — `cpm bump` rewrites
-**only** the `version` field (options, hooks, patches, comments are preserved):
+Bump a dep's version without touching its other settings — `cpm requires bump`
+rewrites **only** the `version` field (options, hooks, patches, comments are
+preserved):
 
 ```sh
-cpm bump boost 1.90.0   # explicit target
-cpm bump boost          # no spec → pin the freshest available
+cpm requires bump boost 1.90.0   # explicit target
+cpm requires bump boost          # no spec → pin the freshest available
 ```
 
 You can also edit `build/cmake/modules/3rdparty/deps.toml` directly (then run
@@ -212,7 +213,7 @@ option(CPM_DOWNLOAD "Allow network during configure (git/tar tiers)" OFF)
 
 ### 4. Generate the CMake glue
 
-`cpm generate` (also run automatically by `requires`/`bump`/`--rm`) emits a
+`cpm generate` (also run automatically by `requires add`/`rm`/`bump`) emits a
 `Find<Package>.cmake` for each dependency and rewrites `3rdparty.cmake` with the
 static registrations synthesised from `deps.toml` + pantry. **From this point the
 project is self-sufficient.**
@@ -336,13 +337,13 @@ and the project's CPM.cmake is vendored and version-controlled.
 
 ### Managing a project's deps (writes `deps.toml` + regenerates)
 
-| Command                      | What it does                                                        |
-|------------------------------|---------------------------------------------------------------------|
-| `cpm requires <name> [spec]` | Add a dep: resolve vs pantry, write `[dep.X]`, regenerate           |
-| `cpm requires --list`        | Show required deps with resolved versions                           |
-| `cpm requires --rm <name>`   | Drop a dep from `deps.toml` (and regenerate)                        |
-| `cpm bump <name> [spec]`     | Change **only** the version, preserving all other settings          |
-| `cpm generate [project]`     | Emit `Find<Name>.cmake` + engine registrations from `deps.toml`     |
+| Command                              | What it does                                                        |
+|--------------------------------------|---------------------------------------------------------------------|
+| `cpm requires add <name> [spec]`     | Add a dep: resolve vs pantry, write `[dep.X]`, regenerate           |
+| `cpm requires rm <name>`             | Drop a dep from `deps.toml` (and regenerate)                        |
+| `cpm requires list`                  | Show required deps with resolved versions                           |
+| `cpm requires bump <name> [spec]`    | Change **only** the version, preserving all other settings          |
+| `cpm generate [project]`             | Emit `Find<Name>.cmake` + engine registrations from `deps.toml`     |
 
 ### Project & environment
 

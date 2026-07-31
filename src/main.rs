@@ -249,40 +249,50 @@ enum Cmd {
     },
     /// Manage this project's required deps (edits deps.toml + regenerates glue)
     ///
-    /// Run from anywhere inside a cpm project (located via `.cpm`). The default
-    /// action is `add`: resolve a version against the global pantry and write a
-    /// fully-defaulted `[dep.X]` stanza (with commented field hints so you see
-    /// every optional override), then regenerate the CMake glue.
-    ///
-    /// Version spec grammar: a bare `1.90.0` is an EXACT pin; a leading operator
-    /// (`^1.85`, `~1.90.0`, `>=1.85 <2.0`) is a constraint re-resolved at
-    /// generate; `*`/omitted = freshest from the pantry.
+    /// Run from anywhere inside a cpm project (located via `.cpm`). Every
+    /// subcommand resolves against the global pantry and regenerates the CMake
+    /// glue. Version spec grammar: a bare `1.90.0` is an EXACT pin; a leading
+    /// operator (`^1.85`, `~1.90.0`, `>=1.85 <2.0`) is a constraint re-resolved
+    /// at generate; `*`/omitted = freshest from the pantry.
     Requires {
-        /// Dependency name (pantry key). Required for add/`--rm`; ignored by `--list`.
-        name: Option<String>,
-        /// Version spec (see above). Oitted = freshest.
+        #[command(subcommand)]
+        cmd: RequiresCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RequiresCmd {
+    /// Add a dependency: resolve a version, write `[dep.X]`, regenerate
+    ///
+    /// Writes a fully-defaulted stanza (package + version + a commented menu of
+    /// optional overrides). Re-running with a different spec updates only
+    /// `version`. Validates against the pantry; errors if no version satisfies.
+    Add {
+        /// Dependency name (pantry key).
+        name: String,
+        /// Version spec (see `cpm requires --help`). Omitted = freshest.
         spec: Option<String>,
-        /// Override the CPM package NAME when it differs from the dependency name.
+        /// Override the CPM package NAME if it differs from the dependency name.
         #[arg(long)]
         package: Option<String>,
-        /// List this project's required deps with their resolved versions.
-        #[arg(long)]
-        list: bool,
-        /// Remove `<name>` from deps.toml (and regenerate).
-        #[arg(long)]
-        rm: bool,
     },
-    /// Bump a dep's version, leaving all its other deps.toml settings intact
+    /// Remove a dependency from deps.toml (and regenerate)
+    Rm {
+        /// Dependency name.
+        name: String,
+    },
+    /// List this project's required deps with their resolved versions
+    List,
+    /// Bump a dependency's version, preserving all its other deps.toml settings
     ///
-    /// Rewrites ONLY the `version` field of an existing `[dep.X]` (options,
-    /// pre/post hooks, patches, comments are preserved). Validates the target
-    /// against the pantry and regenerates. Omit the spec to pin the freshest
-    /// available; if the dep is currently a constraint, reports its freshest
-    /// match without changing the file.
+    /// Rewrites ONLY the `version` field (options, hooks, patches, comments are
+    /// preserved). Omit the spec to pin the freshest available; if the dep is
+    /// currently a constraint, reports its freshest match without changing the
+    /// file.
     Bump {
         /// Dependency name.
         name: String,
-        /// New version spec (same grammar as `requires`). Omit = freshest.
+        /// New version spec. Omit = freshest.
         spec: Option<String>,
     },
 }
@@ -368,19 +378,13 @@ fn main() -> anyhow::Result<()> {
             gen::init(&project, &dir, &scripts, &patches, force)
         }
         Cmd::Generate { project, dir } => gen::generate(&project, &dir),
-        Cmd::Requires { name, spec, package, list, rm } => {
-            if list {
-                commands::requires_list()
-            } else if rm {
-                let name =
-                    name.ok_or_else(|| anyhow::anyhow!("`requires --rm <name>`: name required"))?;
-                commands::requires_rm(&name)
-            } else {
-                let name = name
-                    .ok_or_else(|| anyhow::anyhow!("`requires <name> [spec]`: name required"))?;
+        Cmd::Requires { cmd } => match cmd {
+            RequiresCmd::Add { name, spec, package } => {
                 commands::requires_add(&name, spec.as_deref(), package.as_deref())
             }
-        }
-        Cmd::Bump { name, spec } => commands::bump(&name, spec.as_deref()),
+            RequiresCmd::Rm { name } => commands::requires_rm(&name),
+            RequiresCmd::List => commands::requires_list(),
+            RequiresCmd::Bump { name, spec } => commands::bump(&name, spec.as_deref()),
+        },
     }
 }
