@@ -71,6 +71,12 @@ enum Cmd {
         #[arg(long)]
         latest: bool,
     },
+    /// Update the CPM.cmake bundled in this tool's source tree to the latest stable release.
+    Update {
+        /// Show bundled vs latest without modifying anything.
+        #[arg(long)]
+        check: bool,
+    },
     /// Show resolved paths and environment.
     Env {
         /// Also print shell `export` lines for your rc.
@@ -125,6 +131,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Fetch { force } => commands::fetch(force),
         Cmd::Show { name, hash } => commands::show(&name, hash),
         Cmd::Bootstrap { version, latest } => bootstrap::run(version.as_deref(), latest),
+        Cmd::Update { check } => bootstrap::update(check),
         Cmd::Env { export } => commands::env(export),
         Cmd::Verify { target } => commands::verify(&target),
         Cmd::Init { project, dir } => gen::init(&project, &dir),

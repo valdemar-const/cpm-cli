@@ -68,3 +68,87 @@ fn download(url: &str, dst: &Path) -> Result<()> {
     std::io::copy(&mut reader, &mut file)?;
     Ok(())
 }
+
+/// Rewrite the CPM.cmake version pinned in the tool's own source tree
+/// (`src/get_cpm_default.cmake` + `DEFAULT_CPM_VERSION` in `src/config.rs`)
+/// to the latest stable release. Run from a checkout, then rebuild.
+pub fn update(check: bool) -> Result<()> {
+    let latest = latest_version()?;
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let default_cmake = repo.join("src").join("get_cpm_default.cmake");
+    let config_rs = repo.join("src").join("config.rs");
+
+    let d_src = std::fs::read_to_string(&default_cmake).with_context(|| {
+        format!(
+            "cpm source not found under {} — run `cpm update` from a checkout",
+            repo.display()
+        )
+    })?;
+    let current = extract_marker(&d_src, "set(CPM_DOWNLOAD_VERSION ", ')')?;
+    let old_hash = extract_marker(&d_src, "set(CPM_HASH_SUM \"", '"')?;
+
+    if check {
+        println!("bundled : v{current}");
+        println!("latest  : v{latest}");
+        if latest == current {
+            println!("up to date");
+        } else {
+            println!("update available: {current} -> {latest}");
+        }
+        return Ok(());
+    }
+
+    if latest == current {
+        println!("Already at the latest stable release: CPM.cmake v{current}");
+        return Ok(());
+    }
+
+    let url = format!(
+        "https://github.com/cpm-cmake/CPM.cmake/releases/download/v{latest}/CPM.cmake"
+    );
+    let tmp = config::tmp_dir()?;
+    std::fs::create_dir_all(&tmp)?;
+    let dst = tmp.join(format!("CPM_{latest}.cmake"));
+    println!("downloading CPM.cmake v{latest} ...");
+    download(&url, &dst)?;
+    let hash = crate::archive::sha256_file(&dst)?;
+    let _ = std::fs::remove_file(&dst);
+
+    let d_new = d_src
+        .replace(
+            &format!("set(CPM_DOWNLOAD_VERSION {current})"),
+            &format!("set(CPM_DOWNLOAD_VERSION {latest})"),
+        )
+        .replace(
+            &format!("set(CPM_HASH_SUM \"{old_hash}\")"),
+            &format!("set(CPM_HASH_SUM \"{hash}\")"),
+        );
+    std::fs::write(&default_cmake, d_new)?;
+
+    let c = std::fs::read_to_string(&config_rs)?;
+    let c_new = c.replace(
+        &format!("pub const DEFAULT_CPM_VERSION: &str = \"{current}\";"),
+        &format!("pub const DEFAULT_CPM_VERSION: &str = \"{latest}\";"),
+    );
+    std::fs::write(&config_rs, c_new)?;
+
+    println!("CPM.cmake {current} -> {latest} (sha256 {hash})");
+    println!("  updated {}", default_cmake.display());
+    println!("  updated {}", config_rs.display());
+    println!("rebuild (`cargo build --release`) and commit to finalize.");
+    Ok(())
+}
+
+/// Text between `marker` and the next `terminator` in `content`.
+fn extract_marker(content: &str, marker: &str, terminator: char) -> Result<String> {
+    let i = content
+        .find(marker)
+        .with_context(|| format!("marker `{marker}` not found"))?
+        + marker.len();
+    let j = content[i..]
+        .find(terminator)
+        .with_context(|| format!("terminator `{terminator}` not found after `{marker}`"))?
+        + i;
+    Ok(content[i..j].trim().to_string())
+}

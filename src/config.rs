@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-pub const DEFAULT_CPM_VERSION: &str = "0.42.0";
+pub const DEFAULT_CPM_VERSION: &str = "0.43.1";
 
 /// The tool's own data dir: deps.toml, tmp clones, bootstrapped CPM.cmake.
 /// Override with $CPM_HOME, else XDG data dir (`~/.local/share/cpm`).
