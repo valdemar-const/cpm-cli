@@ -23,6 +23,7 @@ dirs = "5"
 walkdir = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 zip = "0.6"
+terminal_size = "0.4"
 
 [profile.release]
 opt-level = 3

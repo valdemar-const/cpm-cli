@@ -501,11 +501,8 @@ pub fn list() -> Result<()> {
             })
     });
 
-    println!(
-        "{:<20} {:<14} {:<24} {:<10} {:<32} STATUS",
-        "NAME", "VERSION", "TAG", "SIZE", "ARCHIVE"
-    );
-    println!("{}", "-".repeat(114));
+    let headers = ["NAME", "VERSION", "TAG", "SIZE", "ARCHIVE", "STATUS"];
+    let mut rows: Vec<[String; 6]> = Vec::with_capacity(entries.len());
     for dep in &entries {
         let version = dep.version.clone().unwrap_or_else(|| "-".into());
         let tag = dep.tag.clone().unwrap_or_else(|| "-".into());
@@ -521,12 +518,103 @@ pub fn list() -> Result<()> {
             }
             None => ("?".into(), "no CPM_PRELOAD".to_string()),
         };
-        println!(
-            "{:<20} {:<14} {:<24} {:<10} {:<32} {}",
-            dep.name, version, tag, size_str, dep.archive, status
-        );
+        rows.push([
+            dep.name.clone(),
+            version,
+            tag,
+            size_str,
+            dep.archive.clone(),
+            status,
+        ]);
     }
+    // flex columns (shrink to fit): NAME=0, TAG=2, ARCHIVE=4
+    print_table(&headers, &rows, &[0, 2, 4]);
     Ok(())
+}
+
+// ---- table layout -----------------------------------------------------------
+
+/// Column widths are derived from content; when stdout is a terminal whose
+/// width cannot hold the natural layout, the listed `flex` columns are shaved
+/// (the widest first) down to a readable floor, and over-long cells are
+/// truncated with an ellipsis. Non-tty output (pipes/redirects) is left intact.
+fn print_table(headers: &[&str; 6], rows: &[[String; 6]], flex: &[usize]) {
+    let floors = [8usize, 8, 5, 5, 10, 6];
+    let mut w = floors;
+    for (i, h) in headers.iter().enumerate() {
+        w[i] = w[i].max(h.chars().count());
+    }
+    for r in rows {
+        for (i, cell) in r.iter().enumerate() {
+            w[i] = w[i].max(cell.chars().count());
+        }
+    }
+    let seps = headers.len() - 1;
+    let mut total: usize = w.iter().sum::<usize>() + seps;
+
+    if let Some(tw) = term_width() {
+        // shave the widest flex column by one until we fit (or hit all floors)
+        while total > tw {
+            let pick = flex
+                .iter()
+                .copied()
+                .filter(|&i| w[i] > floors[i])
+                .max_by_key(|&i| w[i]);
+            match pick {
+                Some(i) => {
+                    w[i] -= 1;
+                    total -= 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    let table_w: usize = w.iter().sum::<usize>() + seps;
+
+    let emit = |cells: &[&str; 6]| {
+        let mut line = String::new();
+        for (i, c) in cells.iter().enumerate() {
+            if i > 0 {
+                line.push(' ');
+            }
+            line.push_str(&fit(c, w[i]));
+        }
+        println!("{}", line.trim_end());
+    };
+
+    let h = [
+        headers[0], headers[1], headers[2], headers[3], headers[4], headers[5],
+    ];
+    emit(&h);
+    println!("{}", "-".repeat(table_w));
+    for r in rows {
+        emit(&[&r[0], &r[1], &r[2], &r[3], &r[4], &r[5]]);
+    }
+}
+
+/// Truncate `s` to `width` display columns (appending `…`) or left-pad when shorter.
+fn fit(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n <= width {
+        format!("{:<width$}", s)
+    } else if width == 0 {
+        String::new()
+    } else {
+        let kept: String = s.chars().take(width.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
+
+fn term_width() -> Option<usize> {
+    if let Ok(v) = std::env::var("COLUMNS") {
+        if let Ok(n) = v.parse::<usize>() {
+            if n > 0 {
+                return Some(n);
+            }
+        }
+    }
+    terminal_size::terminal_size().map(|(terminal_size::Width(w), _)| w as usize)
 }
 
 // ---- show ------------------------------------------------------------------
