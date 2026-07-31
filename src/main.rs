@@ -31,8 +31,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Acquire a dependency into $CPM_PRELOAD: clone (git) or download/extract/copy
-    /// (fetch), then clean, dereference symlinks, and pack under <name>-<ver>.zip.
+    /// Acquire a dependency into $CPM_PRELOAD
+    ///
+    /// Fetches the source (git clone, an archive download, or a local dir/file),
+    /// strips VCS metadata, dereferences symlinks, and packs it under
+    /// <name>-<version>.zip, then registers it in the pantry ($CPM_HOME/deps.toml).
+    ///
+    /// Source kinds (--kind, default auto):
+    ///
+    ///   git    - `git clone` of a remote or local repo. TAG selects the ref and
+    ///            the version is derived from it (v1.2.3, boost-1.90.0, ...).
+    ///
+    ///   fetch  - download an archive (http(s)://), or extract a local .zip/.tar.*,
+    ///            or copy a local directory. TAG is ignored; the version comes from
+    ///            --version or the archive basename.
+    ///
+    ///   auto   - inferred: archive extension or a local file/dir => fetch; a local
+    ///            git repo => git; otherwise git.
+    ///
+    /// If the target archive already exists and --force is not set, nothing is
+    /// re-fetched: for git the url+tag provenance is (re)recorded, for fetch the
+    /// entry is simply kept (source equivalence is assumed).
+    ///
+    /// Examples:
+    ///
+    ///   cpm add fmt git@github.com:fmtlib/fmt.git 10.2.1
+    ///
+    ///   cpm add boost git@github.com:boostorg/boost.git boost-1.90.0
+    ///
+    ///   cpm add foo https://example.com/foo-1.2.3.tar.gz
+    ///
+    ///   cpm add foo ./local-src --kind fetch --version 1.0.0
+    ///
+    ///   cpm add bar git@github.com:o/r.git abc123 --commit
+    ///
+    /// See also: `cpm source add` (attach a source without fetching), `cpm info`.
     Add {
         /// CPM/CPMAddPackage package name (also the find_package name).
         name: String,
@@ -55,50 +88,87 @@ enum Cmd {
         /// Treat `tag` as a commit hash (git only).
         #[arg(long)]
         commit: bool,
-        /// Overwrite an existing archive.
+        /// Overwrite an existing archive (re-fetch and repack).
         #[arg(long)]
         force: bool,
     },
-    /// List registered dependencies and archive status.
+    /// List registered dependencies, their versions, sources and archive status
+    ///
+    /// One line per pantry entry: name, version, tag, on-disk size, archive
+    /// filename, status (ok / MISSING / no CPM_PRELOAD). Sorted by name, then
+    /// version freshest-first. For per-version sources use `cpm info <name>`.
     List,
-    /// Build any missing archives from the registry.
+    /// Build any missing archives from the pantry (re-clones sourced entries)
+    ///
+    /// Walks the pantry and (re)creates every archive that has a git source
+    /// (url+tag) but no file on disk — or all of them with --force. Loc-only
+    /// entries (no source) are skipped; attach one with `cpm source add` first.
     Fetch {
         /// Rebuild every archive even if it already exists.
         #[arg(long)]
         force: bool,
     },
-    /// Register archives already in $CPM_PRELOAD into the pantry.
+    /// Register archives already in $CPM_PRELOAD into the pantry
+    ///
+    /// Scans $CPM_PRELOAD for *.zip, parses <name>-<version>.zip, computes sha256
+    /// and registers each entry loc-only (no source); non-conforming filenames
+    /// are skipped. With -f, re-fetches each archive from its pantry source
+    /// instead (requires url+tag; errors listing the unsourced ones).
     Import {
         /// Re-fetch from source (requires url+tag in pantry; else errors).
         #[arg(short, long)]
         force: bool,
     },
-    /// Print a ready-to-paste CPMAddPackage(...) snippet.
+    /// Print a ready-to-paste CPMAddPackage(...) snippet for a dependency
+    ///
+    /// Uses the freshest version. With --hash, includes a URL_HASH (SHA256) line.
+    /// For an overview of all versions and their sources, use `cpm info`.
     Show {
+        /// Dependency name (freshest version is used).
         name: String,
         /// Include a URL_HASH (SHA256) line.
         #[arg(long)]
         hash: bool,
     },
-    /// Show a dependency summary: every version and its load sources (git/loc).
+    /// Show a dependency summary: every version and its load sources (git/loc)
+    ///
+    /// For each archived version prints the git upstream (url @ tag, or a hint to
+    /// add one) and the local archive (filename, size, short sha, presence).
+    /// The `git remote -v` equivalent for a dependency.
     Info {
+        /// Dependency name.
         name: String,
     },
-    /// Manage the git source of a pantry entry (cf. `git remote`).
+    /// Manage the git source of a pantry entry (cf. `git remote`)
+    ///
+    /// A "source" is a way to (re)acquire a version's snapshot. `source add`
+    /// attaches a git url+tag to an existing entry without fetching; `source rm`
+    /// detaches it, leaving the entry loc-only. Equivalence is assumed — the
+    /// source is trusted to match the archive, never cross-checked.
     Source {
         #[command(subcommand)]
         cmd: SourceCmd,
     },
-    /// Download official CPM.cmake + get_cpm.cmake into the cpm data dir.
+    /// Download official CPM.cmake + get_cpm.cmake into the cpm data dir
+    ///
+    /// Fetches CPM.cmake <version> (or the latest with --latest, or the configured
+    /// default) into $CPM_HOME/cmake/<version>/ and records it as the active
+    /// version for the tool. Per-project CPM.cmake is refreshed with `cpm update`.
     Bootstrap {
-        /// Specific CPM.cmake version (e.g. 0.42.0).
+        /// Specific CPM.cmake version (e.g. 0.43.1).
         #[arg(long)]
         version: Option<String>,
         /// Pick the latest release from GitHub.
         #[arg(long)]
         latest: bool,
     },
-    /// Refresh the vendored CPM.cmake to the latest stable release.
+    /// Refresh the vendored CPM.cmake to the latest stable release
+    ///
+    /// Default (project-local): downloads the latest CPM.cmake into [paths]
+    /// scripts/ (located via the .cpm anchor at the project root). With -g,
+    /// bumps the version pinned in this tool's own source tree
+    /// (src/get_cpm_default.cmake + config.rs) — rebuild the tool afterwards.
+    /// --check is read-only: prints current vs latest, changes nothing.
     Update {
         /// Target this tool's own bundle instead of the current project.
         #[arg(short, long)]
@@ -107,15 +177,44 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
-    /// Show resolved paths and environment.
+    /// Show resolved paths and environment
+    ///
+    /// Prints CPM_HOME, CPM_PRELOAD, CPM_SOURCE_CACHE, the deps registry path
+    /// and the active CPM.cmake. With --export, also prints `export` lines to
+    /// append to your shell rc.
     Env {
         /// Also print shell `export` lines for your rc.
         #[arg(long)]
         export: bool,
     },
-    /// Inspect an archive (by dep name, archive filename, or path).
-    Verify { target: String },
-    /// Initialize a cpm 3rdparty module in a project.
+    /// Inspect an archive: sha256, size, entries, CMakeLists presence, .git check
+    ///
+    /// TARGET may be a dep name (its freshest archive), an archive filename in
+    /// $CPM_PRELOAD, or a path to a .zip. Reports file/dir counts, top-level
+    /// entries, whether a top-level CMakeLists.txt exists, any .git contamination,
+    /// and cross-checks the sha256 against the pantry entry.
+    Verify {
+        /// Dep name, archive filename, or path to a .zip.
+        target: String,
+    },
+    /// Initialize a cpm 3rdparty module in a project
+    ///
+    /// Generates, under <dir> (default build/cmake/modules/3rdparty):
+    ///
+    ///   3rdparty.cmake  - the static fallback engine (registrations appended later)
+    ///
+    ///   deps.toml       - the project manifest (edit this, then `cpm generate`)
+    ///
+    ///   get_cpm.cmake   - downloads CPM.cmake on demand
+    ///
+    /// and a .cpm anchor at the project root (paths for `cpm update`/`generate`).
+    /// Non-destructive: existing files are kept unless --force. Then in CMakeLists:
+    ///
+    ///   list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/<dir>")
+    ///
+    ///   include("${CMAKE_SOURCE_DIR}/<dir>/3rdparty.cmake")
+    ///
+    ///   find_package(<dep> REQUIRED)
     Init {
         /// Project root (default: current dir).
         #[arg(default_value = ".")]
@@ -133,7 +232,12 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// (Re)generate Find<Name>.cmake + fallback registrations from deps.toml.
+    /// (Re)generate Find<Name>.cmake + fallback registrations from deps.toml
+    ///
+    /// Merges the project deps.toml over the global pantry ($CPM_HOME/deps.toml),
+    /// rewrites the engine body in <dir>/3rdparty.cmake, and emits a
+    /// Find<Package>.cmake per dependency that triggers resolution at
+    /// find_package() time. Re-run after every deps.toml change.
     Generate {
         /// Project root (default: current dir).
         #[arg(default_value = ".")]
@@ -146,17 +250,32 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum SourceCmd {
-    /// Attach a git source (url+tag) to an existing pantry entry (no fetch).
+    /// Attach a git source (url+tag) to an existing pantry entry (no fetch)
+    ///
+    /// The archive must already be on disk (use `cpm add` to fetch a new dep).
+    /// Records the url+tag provenance so `cpm fetch`/`import -f` can re-acquire
+    /// it and the engine's git tier can reach it. Equivalence is assumed: the
+    /// source is trusted to match the archive, never cross-checked.
     Add {
+        /// Dependency name.
         name: String,
+        /// Git URL of the upstream (e.g. git@github.com:owner/repo.git).
         url: String,
+        /// Tag/branch/commit that matches this version's snapshot.
         tag: String,
+        /// Target a specific version (needed when the tag is not a semver, or
+        /// the name has several versions).
         #[arg(long)]
         version: Option<String>,
     },
-    /// Remove the git source from an entry (back to loc-only).
+    /// Remove the git source from an entry (back to loc-only)
+    ///
+    /// Clears the url+tag; the archive stays. The entry is now loc-only (not
+    /// re-fetchable). With several versions, --version selects which one.
     Rm {
+        /// Dependency name.
         name: String,
+        /// Which version (required when the name has several).
         #[arg(long)]
         version: Option<String>,
     },
