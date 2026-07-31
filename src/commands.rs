@@ -560,7 +560,7 @@ pub fn show(name: &str, with_hash: bool) -> Result<()> {
     println!("CPMAddPackage(");
     println!("  NAME {}", name);
     println!("  VERSION {}", version);
-    println!("  URL \"file://{}\"", path.display());
+    println!("  URL \"${{CPM_PRELOAD}}/{}\"", dep.archive);
     if with_hash {
         let sha = if let Some(s) = &dep.sha256 {
             s.clone()
