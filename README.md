@@ -130,6 +130,7 @@ cpm info fmt              # per-version summary: git upstream + local archive
 cpm verify fmt            # peek inside an archive (name / filename / path)
 cpm source add fmt <url> <tag>   # attach/repair a git upstream to an existing entry
 cpm source rm fmt                # detach it (entry stays loc-only)
+cpm rm fmt                       # inverse of `add`: remove entry + its archive
 cpm import [--force]             # register archives in $CPM_PRELOAD (-f: re-fetch from source)
 ```
 
@@ -149,6 +150,7 @@ cpm requires add fmt            # freshest available
 cpm requires add boost "^1.85"  # constraint: resolve to the freshest matching version
 cpm requires add glm 1.0.1      # exact pin (a bare version is always exact)
 cpm requires list               # show every required dep + its resolved version
+cpm requires list --outdated    # only deps behind the pantry's freshest version
 cpm requires rm glad            # drop one
 ```
 
@@ -326,6 +328,7 @@ and the project's CPM.cmake is vendored and version-controlled.
 | Command                      | What it does                                                        |
 |------------------------------|---------------------------------------------------------------------|
 | `cpm add <name> <url> <tag>` | Acquire sources (`--kind auto\|git\|fetch`), pack into `$CPM_PRELOAD`, register |
+| `cpm rm <name> [--version V] [--dry-run]` | Inverse of `add`: remove pantry entry + its archive (all versions, or one) |
 | `cpm import [--force]`       | Register archives already in `$CPM_PRELOAD` (loc-only); `-f` re-fetches from source |
 | `cpm fetch [--force]`        | Re-acquire every pantry dep from its git source (rebuild archives)  |
 | `cpm list`                   | Registered deps + archive status (adapts to terminal width)         |
@@ -341,7 +344,7 @@ and the project's CPM.cmake is vendored and version-controlled.
 |--------------------------------------|---------------------------------------------------------------------|
 | `cpm requires add <name> [spec]`     | Add a dep: resolve vs pantry, write `[dep.X]`, regenerate           |
 | `cpm requires rm <name>`             | Drop a dep from `deps.toml` (and regenerate)                        |
-| `cpm requires list`                  | Show required deps with resolved versions                           |
+| `cpm requires list [--outdated]`     | Required deps + resolved versions (`--outdated`: only those behind the pantry's freshest) |
 | `cpm requires bump <name> [spec]`    | Change **only** the version, preserving all other settings          |
 | `cpm generate [project]`             | Emit `Find<Name>.cmake` + engine registrations from `deps.toml`     |
 

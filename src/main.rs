@@ -120,6 +120,21 @@ enum Cmd {
         #[arg(short, long)]
         force: bool,
     },
+    /// Remove a dependency from the global pantry (inverse of `cpm add`)
+    ///
+    /// Drops the pantry entry (all versions, or one with `--version`) and deletes
+    /// its archive from `$CPM_PRELOAD`. Re-add anytime with `cpm add`.
+    /// `--dry-run` previews without deleting.
+    Rm {
+        /// Dependency name.
+        name: String,
+        /// Remove a specific version (default: all versions of this name).
+        #[arg(long)]
+        version: Option<String>,
+        /// Preview what would be removed; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print a ready-to-paste CPMAddPackage(...) snippet for a dependency
     ///
     /// Uses the freshest version. With --hash, includes a URL_HASH (SHA256) line.
@@ -282,7 +297,13 @@ enum RequiresCmd {
         name: String,
     },
     /// List this project's required deps with their resolved versions
-    List,
+    ///
+    /// With `--outdated`, show only deps whose resolved version is older than the
+    /// freshest available in the pantry (no network — purely a pantry comparison).
+    List {
+        #[arg(long)]
+        outdated: bool,
+    },
     /// Bump a dependency's version, preserving all its other deps.toml settings
     ///
     /// Rewrites ONLY the `version` field (options, hooks, patches, comments are
@@ -362,6 +383,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::List => commands::list(),
         Cmd::Fetch { force } => commands::fetch(force),
         Cmd::Import { force } => commands::import(force),
+        Cmd::Rm { name, version, dry_run } => commands::rm(&name, version.as_deref(), dry_run),
         Cmd::Show { name, hash } => commands::show(&name, hash),
         Cmd::Info { name } => commands::info(&name),
         Cmd::Source { cmd } => match cmd {
@@ -383,7 +405,7 @@ fn main() -> anyhow::Result<()> {
                 commands::requires_add(&name, spec.as_deref(), package.as_deref())
             }
             RequiresCmd::Rm { name } => commands::requires_rm(&name),
-            RequiresCmd::List => commands::requires_list(),
+            RequiresCmd::List { outdated } => commands::requires_list(outdated),
             RequiresCmd::Bump { name, spec } => commands::bump(&name, spec.as_deref()),
         },
     }

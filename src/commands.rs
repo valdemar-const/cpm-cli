@@ -624,6 +624,61 @@ fn term_width() -> Option<usize> {
 
 // ---- requires / bump -------------------------------------------------------
 
+/// `cpm rm <name> [version]` — remove a dep from the global pantry.
+///
+/// The inverse of `cpm add`: drops the pantry entry (all versions, or one with
+/// `--version`) and deletes its archive from `$CPM_PRELOAD`. Re-add anytime.
+pub fn rm(name: &str, version: Option<&str>, dry_run: bool) -> Result<()> {
+    let mut reg = deps::load()?;
+    let key = version.map(deps::version_key);
+    let matched: Vec<&Dep> = reg
+        .deps
+        .iter()
+        .filter(|d| {
+            d.name.eq_ignore_ascii_case(name)
+                && key
+                    .map(|k| d.version.as_deref().map(deps::version_key).as_ref() == Some(&k))
+                    .unwrap_or(true)
+        })
+        .collect();
+    if matched.is_empty() {
+        bail!(
+            "no pantry entry for '{name}'{}",
+            version.map(|v| format!(" @ {v}")).unwrap_or_default()
+        );
+    }
+
+    let verb = if dry_run { "[dry-run] would remove" } else { "removing" };
+    for d in &matched {
+        println!(
+            "{verb} {} {} ({})",
+            d.name,
+            d.version.clone().unwrap_or_else(|| "-".into()),
+            d.archive
+        );
+    }
+    if dry_run {
+        return Ok(());
+    }
+
+    let removed = reg.remove(name, version);
+    deps::save(&reg)?;
+
+    if let Some(p) = config::preload_dir_opt() {
+        for d in &removed {
+            let path = p.join(&d.archive);
+            if path.exists() {
+                if let Err(e) = fs::remove_file(&path) {
+                    eprintln!("warn: could not delete {}: {e}", path.display());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---- requires / bump (project deps.toml) -----------------------------------
+
 /// Commented field-hint block rendered above a freshly created `[dep.X]` header.
 /// Attached as table-header prefix decor (not trailing) so it moves atomically
 /// with the table and never migrates when further stanzas are appended.
@@ -758,33 +813,72 @@ pub fn requires_rm(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// `cpm requires --list` — show what the project requires, with resolved versions.
-pub fn requires_list() -> Result<()> {
+/// `cpm requires list [--outdated]` — show what the project requires.
+pub fn requires_list(outdated: bool) -> Result<()> {
     let (_root, dpath, _rel) = deps_toml_from_cwd()?;
     let reqs = gen::read_required(&dpath)?;
     if reqs.is_empty() {
-        println!("(no deps required yet — `cpm requires <name> [<spec>]`)");
+        println!("(no deps required yet — `cpm requires add <name> [<spec>]`)");
         return Ok(());
     }
     let pantry = deps::load()?;
-    let headers = ["NAME", "SPEC", "RESOLVED", "PACKAGE", "SOURCE"];
-    let mut rows: Vec<Vec<String>> = Vec::new();
+
+    // name, spec, resolved, freshest, package, source, is_outdated
+    let mut enriched: Vec<(String, String, String, Option<String>, String, String, bool)> =
+        Vec::new();
     for r in &reqs {
         let parsed = r.version.as_deref().map(spec::Spec::parse).transpose()?;
         let base = pantry.resolve_dep(&r.key, parsed.as_ref());
         let resolved = base
             .and_then(|b| b.version.clone())
             .unwrap_or_else(|| "-".into());
+        let freshest = pantry.version_strings(&r.key).into_iter().next();
+        let is_outdated = resolved != "-"
+            && freshest
+                .as_deref()
+                .map(|f| deps::version_key(&resolved) < deps::version_key(f))
+                .unwrap_or(false);
         let pkg = r.package.clone().unwrap_or_else(|| r.key.clone());
         let src = match (&base, r.from_stanza) {
-            (None, _) => "missing".to_string(),
-            (Some(_), true) => "stanza".to_string(),
-            (Some(_), false) => "shorthand".to_string(),
-        };
+            (None, _) => "missing",
+            (Some(_), true) => "stanza",
+            (Some(_), false) => "shorthand",
+        }
+        .to_string();
         let spec_disp = r.version.clone().unwrap_or_else(|| "(freshest)".into());
-        rows.push(vec![r.key.clone(), spec_disp, resolved, pkg, src]);
+        enriched.push((r.key.clone(), spec_disp, resolved, freshest, pkg, src, is_outdated));
     }
-    print_table(&headers, &rows, &[0, 2, 3]);
+
+    if outdated {
+        let picked: Vec<_> = enriched.into_iter().filter(|x| x.6).collect();
+        if picked.is_empty() {
+            println!("all dependencies are at their freshest available version");
+            return Ok(());
+        }
+        let headers = ["NAME", "RESOLVED", "FRESHEST", "SPEC", "PACKAGE"];
+        let rows: Vec<Vec<String>> = picked
+            .iter()
+            .map(|(n, spec, res, fresh, pkg, _, _)| {
+                vec![
+                    n.clone(),
+                    res.clone(),
+                    fresh.clone().unwrap_or_else(|| "-".into()),
+                    spec.clone(),
+                    pkg.clone(),
+                ]
+            })
+            .collect();
+        print_table(&headers, &rows, &[0, 3, 4]);
+    } else {
+        let headers = ["NAME", "SPEC", "RESOLVED", "PACKAGE", "SOURCE"];
+        let rows: Vec<Vec<String>> = enriched
+            .iter()
+            .map(|(n, spec, res, _, pkg, src, _)| {
+                vec![n.clone(), spec.clone(), res.clone(), pkg.clone(), src.clone()]
+            })
+            .collect();
+        print_table(&headers, &rows, &[0, 2, 3]);
+    }
     Ok(())
 }
 

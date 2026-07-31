@@ -104,6 +104,22 @@ impl Registry {
             .collect()
     }
 
+    /// Remove entries matching `name` (optionally a specific version by numeric
+    /// key). Returns the removed entries. The inverse of `upsert`.
+    pub fn remove(&mut self, name: &str, version: Option<&str>) -> Vec<Dep> {
+        let key = version.map(version_key);
+        let pred = |d: &Dep| {
+            d.name.eq_ignore_ascii_case(name)
+                && key
+                    .map(|k| d.version.as_deref().map(version_key).as_ref() == Some(&k))
+                    .unwrap_or(true)
+        };
+        let deps = std::mem::take(&mut self.deps);
+        let (removed, kept) = deps.into_iter().partition(pred);
+        self.deps = kept;
+        removed
+    }
+
     /// Insert or replace by (name, numeric version key) — so canonicalising a
     /// version ("3.4" → "3.4.0") updates the same slot instead of spawning a
     /// duplicate.
