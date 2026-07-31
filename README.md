@@ -106,23 +106,73 @@ relocate cpm's files (the paths are recorded in `.cpm`):
 cpm init --dir out/modules/3rdparty --scripts out/scripts --patches out/patches
 ```
 
-### 2. Pre-build archives for offline-first deps
+### 2. Acquire dependencies into the pantry
 
-For any dependency you want available offline, add it to the shared pantry once
-(it's cloned shallowly, VCS metadata stripped, packed into a zip, hashed):
+The shared pantry (`$CPM_HOME/deps.toml` + `$CPM_PRELOAD/*.zip`) is a multi-version
+store of pre-built source archives. Add a dep once and every project on the machine
+reuses it. `cpm add` acquires sources and packs them into a hashed zip:
 
 ```sh
+# git (default): shallow clone at a tag, strip VCS, repack as <name>-<version>.zip
 cpm add fmt https://github.com/fmtlib/fmt.git 10.2.1
 cpm add glm https://github.com/g-truc/glm.git 0.9.9.8
+
+# --kind auto|git|fetch controls how the source is acquired:
+#   fetch = web archive URL / local .zip / local directory (version via --version)
+cpm add foo https://example.com/foo-1.2.3.tar.gz --kind fetch --version 1.2.3
 ```
 
-`cpm list` shows what's registered; `cpm verify fmt` inspects an archive.
+Inspect and manage what's staged:
 
-### 3. Declare dependencies in `deps.toml`
+```sh
+cpm list                  # registered deps + archive status (adapts to terminal width)
+cpm info fmt              # per-version summary: git upstream + local archive
+cpm verify fmt            # peek inside an archive (name / filename / path)
+cpm source add fmt <url> <tag>   # attach/repair a git upstream to an existing entry
+cpm source rm fmt                # detach it (entry stays loc-only)
+cpm import [--force]             # register archives in $CPM_PRELOAD (-f: re-fetch from source)
+```
 
-`build/cmake/modules/3rdparty/deps.toml` is your per-project manifest. It
-**overlays** the global pantry — declare a dep by pantry key, or fully describe
-one that only lives in this project:
+`cpm source add/rm` is the `git remote` analogue: it records provenance so a dep
+can be re-acquired and its git tier can reach upstream. The source is trusted to
+match the archive — it is never cross-checked.
+
+### 3. Declare dependencies in your project
+
+The ergonomic path is `cpm requires` — run it from anywhere inside the project
+(located via `.cpm`). It resolves a version against the pantry, writes a
+fully-defaulted `[dep.X]` stanza into `deps.toml` (with a commented menu of every
+optional override), and regenerates the glue in one shot:
+
+```sh
+cpm requires fmt            # freshest available
+cpm requires boost "^1.85"  # constraint: resolve to the freshest matching version
+cpm requires glm 1.0.1      # exact pin (a bare version is always exact)
+cpm requires --list         # show every required dep + its resolved version
+cpm requires --rm glad      # drop one
+```
+
+The version spec grammar:
+
+| Spec              | Meaning                                                     |
+|-------------------|-------------------------------------------------------------|
+| `1.90.0` (bare)   | **exact pin** (matched by numeric key, so `1.9` ≡ `1.9.0`)  |
+| `^1.85`           | caret — compatible: `>=1.85.0 <2.0.0`                       |
+| `~1.90.0`         | tilde — patch range: `>=1.90.0 <1.91.0`                     |
+| `>=1.85 <2.0`     | comparators (space- or comma-separated)                     |
+| `*` / omitted     | freshest in the pantry                                      |
+
+Bump a dep's version without touching its other settings — `cpm bump` rewrites
+**only** the `version` field (options, hooks, patches, comments are preserved):
+
+```sh
+cpm bump boost 1.90.0   # explicit target
+cpm bump boost          # no spec → pin the freshest available
+```
+
+You can also edit `build/cmake/modules/3rdparty/deps.toml` directly (then run
+`cpm generate`). It **overlays** the global pantry — declare a dep by pantry key,
+or fully describe one that only lives in this project:
 
 ```toml
 project      = "myapp"
@@ -131,23 +181,26 @@ network_when = "CPM_DOWNLOAD"      # CMake predicate gating the network tiers
 # pulled from the pantry as-is (local archive + git/tar tiers baked in)
 deps = ["fmt", "glm"]
 
-# declared only here: git tier, pinned tag
+# rich per-dep overrides (these are the fields `cpm requires` fills for you):
 [dep.freetype]
 package = "Freetype"
+version = "2.14.1"            # exact pin, or a constraint like "^2.14"
 git     = "https://github.com/freetype/freetype.git"
 tag     = "VER-2-14-1"
-version = "2.14.1"
 
-# tarball tier (no git)
 [dep.glad]
 package       = "Glad"
-git           = false
+git           = false                                    # no git tier
 tarball       = "https://github.com/Dav1dde/glad/archive/refs/tags/v2.0.8.zip"
 source_subdir = "cmake"
-options       = ["DOWNLOAD_ONLY"]
-post = '''if(Glad_ADDED)
-  list(APPEND CMAKE_MODULE_PATH ${Glad_SOURCE_DIR}/cmake)
-endif()'''
+options       = ["GLAD_API gl=gl"]
+download_only = true                                     # fetch source, skip add_subdirectory
+post          = "${CMAKE_CURRENT_LIST_DIR}/glad_post.cmake"   # a .cmake file ref
+
+[dep.stb]                                                   # synthetic, target-only
+package   = "STB"
+no_source = true
+post      = '''add_library(stb::headers ALIAS stb_headers)'''
 ```
 
 `network_when` is any CMake variable that is true when network is allowed.
@@ -159,13 +212,10 @@ option(CPM_DOWNLOAD "Allow network during configure (git/tar tiers)" OFF)
 
 ### 4. Generate the CMake glue
 
-```sh
-cpm generate
-```
-
-This emits a `Find<Package>.cmake` for each dependency and rewrites
-`3rdparty.cmake` with the static registrations synthesised from `deps.toml` +
-pantry. **From this point the project is self-sufficient.**
+`cpm generate` (also run automatically by `requires`/`bump`/`--rm`) emits a
+`Find<Package>.cmake` for each dependency and rewrites `3rdparty.cmake` with the
+static registrations synthesised from `deps.toml` + pantry. **From this point the
+project is self-sufficient.**
 
 ### 5. Wire it into CMakeLists.txt
 
@@ -195,7 +245,32 @@ cmake -B build            # CPM_DOWNLOAD not set → only local archives used
 cmake --build build
 ```
 
-That's the whole loop: **`cpm add` / edit `deps.toml` → `cpm generate` → build.**
+That's the whole loop: **`cpm add` / `cpm requires` → (edit) → `cpm generate` → build.**
+
+---
+
+## Hooks (`pre` / `post`) and `download_only`
+
+Run CMake around a dep's `add_subdirectory()`. A hook is either an **inline
+snippet** (written to `pre_<key>.cmake` / `post_<key>.cmake` next to the engine)
+or a **`.cmake` file reference** (a single line ending in `.cmake`, e.g.
+`${CMAKE_CURRENT_LIST_DIR}/my_post.cmake`), which is passed through verbatim —
+so you can keep complex glue under your own version-controlled file.
+
+```toml
+[dep.glad]
+download_only = true                                      # fetch source, skip add_subdirectory
+post = "${CMAKE_CURRENT_LIST_DIR}/glad_post.cmake"        # declare the targets yourself
+
+[dep.foo]
+post = '''if(NOT TARGET foo::foo)
+  add_library(foo::foo ALIAS foo)
+endif()'''                                                # inline snippet → post_foo.cmake
+```
+
+`download_only = true` makes CPM fetch the source but not build it — you declare
+the target(s) in `post`. Inside a post hook the fetched tree is exposed as
+`${<Package>_SOURCE_DIR}` (read from CPM's cache variable).
 
 ---
 
@@ -245,18 +320,42 @@ and the project's CPM.cmake is vendored and version-controlled.
 
 ## Command reference
 
+### Acquiring & inspecting deps (global pantry)
+
 | Command                      | What it does                                                        |
 |------------------------------|---------------------------------------------------------------------|
-| `cpm init [project]`         | Scaffold the 3rdparty module + `.cpm` (non-destructive; `--dir/--scripts/--patches/--force`) |
-| `cpm add <name> <url> <tag>` | Clone, strip VCS, pack into `$CPM_PRELOAD`, register in pantry      |
-| `cpm list`                   | Show registered deps and archive status                             |
-| `cpm fetch [--force]`        | Build any missing archives from the pantry                          |
+| `cpm add <name> <url> <tag>` | Acquire sources (`--kind auto\|git\|fetch`), pack into `$CPM_PRELOAD`, register |
+| `cpm import [--force]`       | Register archives already in `$CPM_PRELOAD` (loc-only); `-f` re-fetches from source |
+| `cpm fetch [--force]`        | Re-acquire every pantry dep from its git source (rebuild archives)  |
+| `cpm list`                   | Registered deps + archive status (adapts to terminal width)         |
+| `cpm info <name>`            | Per-version summary: git upstream + local archive (`git remote -v` analogue) |
 | `cpm show <name> [--hash]`   | Print a ready-to-paste `CPMAddPackage(...)` snippet                 |
 | `cpm verify <target>`        | Inspect an archive (name / filename / path)                         |
+| `cpm source add <name> <url> <tag>` | Attach a git upstream to an entry (no fetch)                |
+| `cpm source rm <name>`       | Detach the git source (entry stays loc-only)                        |
+
+### Managing a project's deps (writes `deps.toml` + regenerates)
+
+| Command                      | What it does                                                        |
+|------------------------------|---------------------------------------------------------------------|
+| `cpm requires <name> [spec]` | Add a dep: resolve vs pantry, write `[dep.X]`, regenerate           |
+| `cpm requires --list`        | Show required deps with resolved versions                           |
+| `cpm requires --rm <name>`   | Drop a dep from `deps.toml` (and regenerate)                        |
+| `cpm bump <name> [spec]`     | Change **only** the version, preserving all other settings          |
 | `cpm generate [project]`     | Emit `Find<Name>.cmake` + engine registrations from `deps.toml`     |
+
+### Project & environment
+
+| Command                      | What it does                                                        |
+|------------------------------|---------------------------------------------------------------------|
+| `cpm init [project]`         | Scaffold the 3rdparty module + `.cpm` (`--dir/--scripts/--patches/--force`) |
 | `cpm update [--check] [-g]`  | Refresh vendored CPM.cmake (project) or the tool's bundle (`-g`)    |
 | `cpm bootstrap [--latest]`   | Download CPM.cmake + get_cpm.cmake into `$CPM_HOME`                 |
 | `cpm env [--export]`         | Show resolved paths / print shell exports                           |
+
+`<spec>` grammar (for `requires`/`bump`): bare `1.90.0` = exact pin; `^1.85`,
+`~1.90.0`, `>=1.85 <2.0` = constraint (re-resolved at generate); `*`/omitted =
+freshest.
 
 ---
 
