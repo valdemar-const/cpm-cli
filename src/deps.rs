@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::spec;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Dep {
@@ -76,6 +77,31 @@ impl Registry {
             }
             None => Some(all[0]),
         }
+    }
+
+    /// Resolve via a [`spec::Spec`]: `None` behaves as `Any` (freshest). Picks
+    /// the freshest matching entry — exact pins by numeric key, constraints by
+    /// `semver` matching, `Any`/`*` = freshest overall.
+    pub fn resolve_dep(&self, name: &str, spec: Option<&spec::Spec>) -> Option<&Dep> {
+        let all = self.versions(name);
+        if all.is_empty() {
+            return None;
+        }
+        let s = spec.unwrap_or(&spec::Spec::Any);
+        let vstrs = self.version_strings(name);
+        let resolved = spec::resolve(s, vstrs.iter().map(String::as_str))?;
+        let key = version_key(&resolved);
+        all.iter()
+            .find(|d| d.version.as_deref().map(version_key).as_ref() == Some(&key))
+            .copied()
+    }
+
+    /// Available version strings for `name`, freshest-first.
+    pub fn version_strings(&self, name: &str) -> Vec<String> {
+        self.versions(name)
+            .iter()
+            .map(|d| d.version.clone().unwrap_or_else(|| "0".into()))
+            .collect()
     }
 
     /// Insert or replace by (name, numeric version key) — so canonicalising a

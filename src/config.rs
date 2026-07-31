@@ -170,3 +170,16 @@ pub fn load_project_config(root: &Path) -> Result<ProjectConfig> {
         .with_context(|| format!("reading {}", p.display()))?;
     toml::from_str(&s).with_context(|| format!("parsing {}", p.display()))
 }
+
+/// From CWD, locate the cpm project root and its module dir.
+/// Returns `(root, module_dir_relative)` so callers can invoke `generate`.
+pub fn locate_module() -> Result<(PathBuf, String)> {
+    let root = find_project_root()?;
+    let cfg = load_project_config(&root)?;
+    let rel = cfg
+        .paths
+        .module
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("`.cpm` has no [paths] module"))?;
+    Ok((root, rel))
+}

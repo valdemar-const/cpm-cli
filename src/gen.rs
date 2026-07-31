@@ -15,6 +15,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 use crate::deps;
+use crate::spec;
 
 const ENGINE_CMAKE: &str = include_str!("engine.cmake");
 const GET_CPM_DEFAULT_CMAKE: &str = include_str!("get_cpm_default.cmake");
@@ -148,6 +149,53 @@ fn module_dir(project: &Path, rel: &str) -> std::path::PathBuf {
     project.join(rel)
 }
 
+/// A project's required dependency, read from deps.toml (for `requires --list`).
+pub struct RequiredDep {
+    pub key: String,
+    /// version spec string as written (exact pin, constraint, or None=freshest).
+    pub version: Option<String>,
+    pub package: Option<String>,
+    /// true if a `[dep.X]` stanza exists; false if the name is only in `deps[]`.
+    pub from_stanza: bool,
+}
+
+/// Parse a project's deps.toml into the ordered union of required deps.
+pub fn read_required(path: &Path) -> Result<Vec<RequiredDep>> {
+    let txt = std::fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let manifest: Manifest = toml::from_str(&txt).context("parse deps.toml")?;
+    let mut out: Vec<RequiredDep> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for k in &manifest.deps {
+        if seen.insert(k.clone()) {
+            out.push(RequiredDep {
+                key: k.clone(),
+                version: None,
+                package: None,
+                from_stanza: false,
+            });
+        }
+    }
+    for (k, spec) in &manifest.dep {
+        if seen.insert(k.clone()) {
+            out.push(required_from_spec(k, spec));
+        } else if let Some(slot) = out.iter_mut().find(|r| &r.key == k) {
+            // a shorthand entry also has a stanza: enrich it.
+            *slot = required_from_spec(k, spec);
+        }
+    }
+    Ok(out)
+}
+
+fn required_from_spec(key: &str, spec: &DepSpec) -> RequiredDep {
+    RequiredDep {
+        key: key.to_string(),
+        version: spec.version.clone(),
+        package: spec.package.clone(),
+        from_stanza: true,
+    }
+}
+
 pub fn init(project: &str, rel: &str, scripts: &str, patches: &str, force: bool) -> Result<()> {
     let project = Path::new(project);
     let dir = module_dir(project, rel);
@@ -261,7 +309,14 @@ pub fn generate(project: &str, rel: &str) -> Result<()> {
 
     for key in &keys {
         let spec = manifest.dep.get(key).cloned().unwrap_or_default();
-        let base = pantry.pick(key, spec.version.as_deref());
+        // `version` may be an exact pin, a constraint (^/~/>=/...), or absent (=freshest).
+        let parsed_spec = spec
+            .version
+            .as_deref()
+            .map(spec::Spec::parse)
+            .transpose()
+            .with_context(|| format!("dep '{key}': bad version spec"))?;
+        let base = pantry.resolve_dep(key, parsed_spec.as_ref());
 
         // valid if any source data is available: pantry entry, explicit source
         // list, no_source (synthetic), or a declared tarball/git url.
@@ -271,6 +326,17 @@ pub fn generate(project: &str, rel: &str) -> Result<()> {
             || spec.tarball.is_some()
             || matches!(spec.git, Some(GitField::Url(_)));
         if !has_data {
+            if let Some(s) = &parsed_spec {
+                bail!(
+                    "no version of '{key}' satisfies `{}` (available: {})",
+                    s.display(),
+                    if pantry.version_strings(key).is_empty() {
+                        "none".into()
+                    } else {
+                        pantry.version_strings(key).join(", ")
+                    }
+                );
+            }
             bail!(
                 "dep '{key}' has no source data.\n\
                  add it via `cpm add {key} <url> <tag>`, or declare git/tarball explicitly in deps.toml."
@@ -278,10 +344,16 @@ pub fn generate(project: &str, rel: &str) -> Result<()> {
         }
 
         let pkg = spec.package.clone().unwrap_or_else(|| key.clone());
-        let version = spec
-            .version
-            .clone()
-            .or_else(|| base.and_then(|b| b.version.clone()))
+        // Emit the resolved concrete version (from pantry), not the constraint
+        // string. Fall back to an exact spec/tag only when there is no pantry
+        // entry (e.g. synthetic no_source deps).
+        let version = base
+            .and_then(|b| b.version.clone())
+            .or_else(|| {
+                spec.version
+                    .clone()
+                    .filter(|s| matches!(spec::Spec::parse(s), Ok(spec::Spec::Exact(_))))
+            })
             .or_else(|| spec.tag.clone())
             .or_else(|| base.and_then(|b| b.tag.clone()));
 

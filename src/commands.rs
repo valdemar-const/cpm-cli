@@ -3,13 +3,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::archive;
 use crate::config;
 use crate::deps::{self, Dep};
+use crate::gen;
 use crate::git;
 use crate::source;
+use crate::spec;
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -502,7 +504,7 @@ pub fn list() -> Result<()> {
     });
 
     let headers = ["NAME", "VERSION", "TAG", "SIZE", "ARCHIVE", "STATUS"];
-    let mut rows: Vec<[String; 6]> = Vec::with_capacity(entries.len());
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(entries.len());
     for dep in &entries {
         let version = dep.version.clone().unwrap_or_else(|| "-".into());
         let tag = dep.tag.clone().unwrap_or_else(|| "-".into());
@@ -518,7 +520,7 @@ pub fn list() -> Result<()> {
             }
             None => ("?".into(), "no CPM_PRELOAD".to_string()),
         };
-        rows.push([
+        rows.push(vec![
             dep.name.clone(),
             version,
             tag,
@@ -538,18 +540,19 @@ pub fn list() -> Result<()> {
 /// width cannot hold the natural layout, the listed `flex` columns are shaved
 /// (the widest first) down to a readable floor, and over-long cells are
 /// truncated with an ellipsis. Non-tty output (pipes/redirects) is left intact.
-fn print_table(headers: &[&str; 6], rows: &[[String; 6]], flex: &[usize]) {
-    let floors = [8usize, 8, 5, 5, 10, 6];
-    let mut w = floors;
-    for (i, h) in headers.iter().enumerate() {
-        w[i] = w[i].max(h.chars().count());
-    }
+fn print_table(headers: &[&str], rows: &[Vec<String>], flex: &[usize]) {
+    let ncols = headers.len();
+    // per-column floor: header width (so the header always fits), min 6.
+    let floors: Vec<usize> = headers.iter().map(|h| h.chars().count().max(6)).collect();
+    let mut w = floors.clone();
     for r in rows {
         for (i, cell) in r.iter().enumerate() {
-            w[i] = w[i].max(cell.chars().count());
+            if i < ncols {
+                w[i] = w[i].max(cell.chars().count());
+            }
         }
     }
-    let seps = headers.len() - 1;
+    let seps = ncols.saturating_sub(1);
     let mut total: usize = w.iter().sum::<usize>() + seps;
 
     if let Some(tw) = term_width() {
@@ -558,7 +561,7 @@ fn print_table(headers: &[&str; 6], rows: &[[String; 6]], flex: &[usize]) {
             let pick = flex
                 .iter()
                 .copied()
-                .filter(|&i| w[i] > floors[i])
+                .filter(|&i| i < ncols && w[i] > floors[i])
                 .max_by_key(|&i| w[i]);
             match pick {
                 Some(i) => {
@@ -571,25 +574,27 @@ fn print_table(headers: &[&str; 6], rows: &[[String; 6]], flex: &[usize]) {
     }
 
     let table_w: usize = w.iter().sum::<usize>() + seps;
+    let wref = &w;
 
-    let emit = |cells: &[&str; 6]| {
+    let emit = |cells: &[String]| {
         let mut line = String::new();
         for (i, c) in cells.iter().enumerate() {
+            if i >= ncols {
+                break;
+            }
             if i > 0 {
                 line.push(' ');
             }
-            line.push_str(&fit(c, w[i]));
+            line.push_str(&fit(c, wref[i]));
         }
         println!("{}", line.trim_end());
     };
 
-    let h = [
-        headers[0], headers[1], headers[2], headers[3], headers[4], headers[5],
-    ];
-    emit(&h);
+    let hrow: Vec<String> = headers.iter().map(|s| s.to_string()).collect();
+    emit(&hrow);
     println!("{}", "-".repeat(table_w));
     for r in rows {
-        emit(&[&r[0], &r[1], &r[2], &r[3], &r[4], &r[5]]);
+        emit(r);
     }
 }
 
@@ -615,6 +620,258 @@ fn term_width() -> Option<usize> {
         }
     }
     terminal_size::terminal_size().map(|(terminal_size::Width(w), _)| w as usize)
+}
+
+// ---- requires / bump -------------------------------------------------------
+
+/// Commented field-hint block rendered above a freshly created `[dep.X]` header.
+/// Attached as table-header prefix decor (not trailing) so it moves atomically
+/// with the table and never migrates when further stanzas are appended.
+fn hint_for(name: &str) -> String {
+    format!(
+        "\n# {name} — optional overrides (uncomment a line inside the table to enable):\n\
+         #   options       = [\"OPT=ON\", \"...\"]   # extra CPMAddPackage args\n\
+         #   source_subdir = \"libs/foo\"           # nested CMakeLists in the archive\n\
+         #   download_only = false                  # fetch source, skip add_subdirectory; declare targets in `post`\n\
+         #   pre  = \"...\"                          # cmake snippet OR a `.cmake` file ref (before add_subdirectory)\n\
+         #   post = \"...\"                          # (after)\n\
+         #   patches = [\"name.patch\"]              # applied via CPM_PATCH_COMMAND\n\
+         #   aliases = {{ \"pkg::x\" = \"X\" }}\n"
+    )
+}
+
+/// Surgically set `version` in a table, preserving any existing decor (so the
+/// commented hint block and user comments on the version line survive a bump).
+fn table_set_version(t: &mut toml_edit::Table, value: String) {
+    let prev_decor = t
+        .get("version")
+        .and_then(|i| i.as_value())
+        .map(|v| v.decor().clone());
+    t["version"] = toml_edit::value(value);
+    if let Some(d) = prev_decor {
+        if let Some(v) = t["version"].as_value_mut() {
+            *v.decor_mut() = d;
+        }
+    }
+}
+
+fn ensure_dep_table<'a>(doc: &'a mut toml_edit::DocumentMut) -> &'a mut toml_edit::Table {
+    let root = doc.as_table_mut();
+    if !root.contains_key("dep") {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        root["dep"] = toml_edit::Item::Table(t);
+    }
+    root["dep"].as_table_mut().expect("dep is a table")
+}
+
+fn deps_toml_from_cwd() -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let (root, rel) = config::locate_module()?;
+    Ok((root.clone(), root.join(&rel).join("deps.toml"), rel))
+}
+
+/// `cpm requires <name> [<spec>]` — add a dep to the project manifest.
+pub fn requires_add(name: &str, spec_str: Option<&str>, package: Option<&str>) -> Result<()> {
+    let pantry = deps::load()?;
+    let parsed = spec_str.map(spec::Spec::parse).transpose()?;
+    let base = pantry.resolve_dep(name, parsed.as_ref()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no version of '{name}' satisfies `{}`; {}",
+            spec_str.unwrap_or("(freshest)"),
+            avail(&pantry, name)
+        )
+    })?;
+    // what to write into deps.toml: constraints stay as ranges (re-resolved at
+    // generate); exact/any collapse to the resolved concrete version.
+    let to_write = match &parsed {
+        Some(spec::Spec::Constraint(_)) => spec_str.unwrap().to_string(),
+        _ => base.version.clone().unwrap_or_else(|| "0".into()),
+    };
+
+    let (root, dpath, rel) = deps_toml_from_cwd()?;
+    let txt = fs::read_to_string(&dpath)
+        .with_context(|| format!("read {} (run `cpm init` first)", dpath.display()))?;
+    let mut doc: toml_edit::DocumentMut =
+        txt.parse().with_context(|| format!("parse {}", dpath.display()))?;
+
+    let dep = ensure_dep_table(&mut doc);
+    let existed = dep.contains_key(name);
+    if !existed {
+        // create the table first, then decorate its header prefix with hints.
+        dep[name] = toml_edit::table();
+        let newtbl = dep[name].as_table_mut().expect("dep entry is a table");
+        newtbl.decor_mut().set_prefix(&hint_for(name));
+        let pkg = package.unwrap_or(name).to_string();
+        newtbl["package"] = toml_edit::value(pkg);
+        newtbl["version"] = toml_edit::value(to_write.clone());
+    } else {
+        let t = dep[name].as_table_mut().expect("dep entry is a table");
+        table_set_version(t, to_write.clone());
+    }
+
+    fs::write(&dpath, doc.to_string())?;
+    gen::generate(&root.to_string_lossy(), &rel)?;
+
+    println!(
+        "{name}: required {} → resolved {}",
+        spec_str.unwrap_or("(freshest)"),
+        base.version.clone().unwrap_or_else(|| "?".into())
+    );
+    Ok(())
+}
+
+/// `cpm requires --rm <name>` — drop a dep from the project manifest.
+pub fn requires_rm(name: &str) -> Result<()> {
+    let (root, dpath, rel) = deps_toml_from_cwd()?;
+    let txt = fs::read_to_string(&dpath).with_context(|| format!("read {}", dpath.display()))?;
+    let mut doc: toml_edit::DocumentMut =
+        txt.parse().with_context(|| format!("parse {}", dpath.display()))?;
+
+    let mut removed = false;
+    if let Some(dep) = doc.get_mut("dep").and_then(|i| i.as_table_mut()) {
+        if dep.remove(name).is_some() {
+            removed = true;
+        }
+    }
+    if let Some(arr) = doc
+        .get_mut("deps")
+        .and_then(|i| i.as_value_mut())
+        .and_then(|v| v.as_array_mut())
+    {
+        let mut i = 0;
+        while i < arr.len() {
+            if arr.get(i).and_then(|v| v.as_str()) == Some(name) {
+                arr.remove(i);
+                removed = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if !removed {
+        bail!("'{name}' is not required in this project");
+    }
+
+    fs::write(&dpath, doc.to_string())?;
+    gen::generate(&root.to_string_lossy(), &rel)?;
+    println!("removed {name} (regenerated glue)");
+    Ok(())
+}
+
+/// `cpm requires --list` — show what the project requires, with resolved versions.
+pub fn requires_list() -> Result<()> {
+    let (_root, dpath, _rel) = deps_toml_from_cwd()?;
+    let reqs = gen::read_required(&dpath)?;
+    if reqs.is_empty() {
+        println!("(no deps required yet — `cpm requires <name> [<spec>]`)");
+        return Ok(());
+    }
+    let pantry = deps::load()?;
+    let headers = ["NAME", "SPEC", "RESOLVED", "PACKAGE", "SOURCE"];
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for r in &reqs {
+        let parsed = r.version.as_deref().map(spec::Spec::parse).transpose()?;
+        let base = pantry.resolve_dep(&r.key, parsed.as_ref());
+        let resolved = base
+            .and_then(|b| b.version.clone())
+            .unwrap_or_else(|| "-".into());
+        let pkg = r.package.clone().unwrap_or_else(|| r.key.clone());
+        let src = match (&base, r.from_stanza) {
+            (None, _) => "missing".to_string(),
+            (Some(_), true) => "stanza".to_string(),
+            (Some(_), false) => "shorthand".to_string(),
+        };
+        let spec_disp = r.version.clone().unwrap_or_else(|| "(freshest)".into());
+        rows.push(vec![r.key.clone(), spec_disp, resolved, pkg, src]);
+    }
+    print_table(&headers, &rows, &[0, 2, 3]);
+    Ok(())
+}
+
+/// `cpm bump <name> [<spec>]` — change ONLY the version, preserving user settings.
+pub fn bump(name: &str, spec_str: Option<&str>) -> Result<()> {
+    let (root, dpath, rel) = deps_toml_from_cwd()?;
+    let txt = fs::read_to_string(&dpath).with_context(|| format!("read {}", dpath.display()))?;
+    let mut doc: toml_edit::DocumentMut =
+        txt.parse().with_context(|| format!("parse {}", dpath.display()))?;
+
+    let has = doc
+        .get("dep")
+        .and_then(|d| d.as_table())
+        .map(|d| d.contains_key(name))
+        .unwrap_or(false);
+    if !has {
+        bail!("'{name}' is not required in this project; use `cpm requires {name} [<spec>]`");
+    }
+
+    let current = doc["dep"][name]
+        .as_table()
+        .and_then(|t| t.get("version"))
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let cur_spec = current.as_deref().map(spec::Spec::parse).transpose()?;
+
+    let pantry = deps::load()?;
+
+    // No new spec given:
+    //   - if current is a constraint → it already auto-resolves at generate;
+    //     just report the freshest match, change nothing.
+    //   - else (exact/none) → pin to the freshest available.
+    let (to_write, resolved): (Option<String>, String) = match (&cur_spec, spec_str) {
+        (Some(spec::Spec::Constraint(_)), None) => {
+            let base = pantry
+                .resolve_dep(name, cur_spec.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("no version of '{name}' satisfies `{}`", current.as_deref().unwrap_or("")))?;
+            (None, base.version.clone().unwrap_or_else(|| "?".into()))
+        }
+        _ => {
+            let parsed = spec_str.map(spec::Spec::parse).transpose()?;
+            let base = pantry.resolve_dep(name, parsed.as_ref()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no version of '{name}' satisfies `{}`; {}",
+                    spec_str.unwrap_or("(freshest)"),
+                    avail(&pantry, name)
+                )
+            })?;
+            let w = match &parsed {
+                Some(spec::Spec::Constraint(_)) => spec_str.unwrap().to_string(),
+                _ => base.version.clone().unwrap_or_else(|| "0".into()),
+            };
+            (Some(w), base.version.clone().unwrap_or_else(|| "?".into()))
+        }
+    };
+
+    match to_write {
+        None => {
+            println!("{name}: constrained to `{}` → resolves to {resolved}", current.as_deref().unwrap_or(""));
+            Ok(())
+        }
+        Some(w) => {
+            if Some(&w) == current.as_ref() {
+                println!("{name}: already at {w}");
+                return Ok(());
+            }
+            let t = doc["dep"][name].as_table_mut().expect("dep entry is a table");
+            table_set_version(t, w.clone());
+            fs::write(&dpath, doc.to_string())?;
+            gen::generate(&root.to_string_lossy(), &rel)?;
+            println!(
+                "{name}: {} → {resolved}",
+                current.as_deref().unwrap_or("-")
+            );
+            Ok(())
+        }
+    }
+}
+
+fn avail(reg: &deps::Registry, name: &str) -> String {
+    let v = reg.version_strings(name);
+    if v.is_empty() {
+        format!("not in pantry — `cpm add {name} <url> <tag>`")
+    } else {
+        format!("available: {}", v.join(", "))
+    }
 }
 
 // ---- show ------------------------------------------------------------------
