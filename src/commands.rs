@@ -154,15 +154,34 @@ pub fn add(
         .unwrap_or_else(|| default_archive_name(name, &version));
     let archive_path = preload.join(&archive);
 
+    if archive_path.exists() && !force {
+        // Tarball already present: trust it, just attach the source (url+tag) to
+        // the registry entry — no re-download, no repack.
+        let sha = archive::sha256_file(&archive_path)?;
+        let size = fs::metadata(&archive_path)?.len();
+        let submodules = reg.pick(name, Some(&version)).and_then(|d| d.submodules);
+        reg.upsert(Dep {
+            name: name.to_ascii_lowercase(),
+            url: Some(url.to_string()),
+            tag: Some(tag.to_string()),
+            archive: archive.clone(),
+            version: Some(version.clone()),
+            sha256: Some(sha),
+            added_at: Some(now_rfc3339()),
+            submodules,
+        });
+        deps::save(&reg)?;
+        println!(
+            "attached source to existing {} ({})",
+            archive,
+            human_bytes(size)
+        );
+        println!("  {} @ {}", url, tag);
+        println!("  (pass --force to re-fetch and repack)");
+        return Ok(());
+    }
     if archive_path.exists() {
-        if force {
-            let _ = fs::remove_file(&archive_path);
-        } else {
-            bail!(
-                "archive already exists: {}\n  use --force to overwrite, or --archive <name>",
-                archive_path.display()
-            );
-        }
+        let _ = fs::remove_file(&archive_path);
     }
 
     let tmp_root = config::tmp_dir()?;
