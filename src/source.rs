@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
@@ -23,7 +22,7 @@ const ARCH_EXTS: &[&str] = &[
 
 fn basename(url: &str) -> &str {
     let path = url.split(['?', '#']).next().unwrap_or(url);
-    path.rsplit('/').next().unwrap_or(path)
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 pub fn strip_archive_ext(name: &str) -> &str {
@@ -149,18 +148,27 @@ fn extract_zip(archive: &Path, destdir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Shell out to the system `tar` (handles .tar/.tar.gz/.tar.xz/.tar.bz2 uniformly).
+/// Extract a .tar / .tar.gz / .tar.xz / .tar.bz2 archive in-process (no external
+/// `tar` binary needed — works on any OS). The `tar` crate guards against path
+/// traversal ("zip-slip") during unpack.
 fn extract_tar(archive: &Path, destdir: &Path) -> Result<()> {
-    let st = Command::new("tar")
-        .arg("xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(destdir)
-        .status()
-        .with_context(|| format!("invoke tar for {}", archive.display()))?;
-    if !st.success() {
-        bail!("tar extract failed (exit {:?})", st.code());
-    }
+    let lower = archive.to_string_lossy().to_ascii_lowercase();
+    let f = fs::File::open(archive)
+        .with_context(|| format!("open {}", archive.display()))?;
+    let buf = std::io::BufReader::new(f);
+    let reader: Box<dyn std::io::Read> = if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Box::new(flate2::read::GzDecoder::new(buf))
+    } else if lower.ends_with(".tar.xz") || lower.ends_with(".txz") {
+        Box::new(xz2::read::XzDecoder::new_multi_decoder(buf))
+    } else if lower.ends_with(".tar.bz2") || lower.ends_with(".tbz2") {
+        Box::new(bzip2::read::BzDecoder::new(buf))
+    } else {
+        Box::new(buf)
+    };
+    let mut ar = tar::Archive::new(reader);
+    ar.set_overwrite(true);
+    ar.unpack(destdir)
+        .with_context(|| format!("extract tar {}", archive.display()))?;
     Ok(())
 }
 

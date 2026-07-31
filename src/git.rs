@@ -77,15 +77,16 @@ const VCS_FILES: &[&str] = &[
     ".bzrignore",
 ];
 
-#[cfg(unix)]
+/// Clear read-only bits across a tree so VCS metadata (e.g. git pack files) can
+/// be deleted. Cross-platform: on Unix this sets the owner-write bit (0o200),
+/// on Windows it clears FILE_ATTRIBUTE_READONLY — without this, `remove_dir_all`
+/// fails to delete `.git` on Windows and archives get VCS-contaminated.
 fn make_tree_writable(root: &Path) {
     for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
-        use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = entry.metadata() {
-            let mode = meta.permissions().mode();
-            if mode & 0o200 == 0 {
+            if meta.permissions().readonly() {
                 let mut perms = meta.permissions();
-                perms.set_mode(mode | 0o200);
+                perms.set_readonly(false);
                 let _ = std::fs::set_permissions(entry.path(), perms);
             }
         }
@@ -94,7 +95,6 @@ fn make_tree_writable(root: &Path) {
 
 /// Remove version-control metadata so it doesn't bloat the archive.
 pub fn clean_vcs(root: &Path) -> Result<()> {
-    #[cfg(unix)]
     make_tree_writable(root);
 
     let mut to_remove: Vec<(PathBuf, bool /*is_dir*/)> = Vec::new();
@@ -151,8 +151,12 @@ pub fn dereference_symlinks(root: &Path) -> Result<()> {
         } else {
             link.parent().unwrap_or(Path::new(".")).join(target)
         };
-        // remove the symlink itself (works for both file and dir symlinks)
-        let _ = std::fs::remove_file(&link);
+        // remove the symlink itself. On Unix `remove_file` handles both file and
+        // dir symlinks; on Windows a dir symlink needs `remove_dir` (and never
+        // `remove_dir_all`, which would recurse into the link's target).
+        if !std::fs::remove_file(&link).is_ok() {
+            let _ = std::fs::remove_dir(&link);
+        }
         if resolved.is_dir() {
             copy_dir_recursive(&resolved, &link)?;
         } else if let Ok(_) = std::fs::metadata(&resolved) {

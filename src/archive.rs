@@ -35,14 +35,17 @@ pub fn zip_dir(root: &Path, out: &Path) -> Result<()> {
             zw.add_directory(format!("{rel_str}/"), opts)
                 .with_context(|| format!("zip add dir {}", rel_str))?;
         } else if entry.file_type().is_file() {
-            let mut opts = base_opts();
             #[cfg(unix)]
-            {
+            let opts = {
                 use std::os::unix::fs::PermissionsExt;
+                let mut opts = base_opts();
                 if let Ok(m) = std::fs::metadata(entry.path()) {
                     opts = opts.unix_permissions(m.permissions().mode() & 0o777);
                 }
-            }
+                opts
+            };
+            #[cfg(not(unix))]
+            let opts = base_opts();
             zw.start_file(&rel_str, opts)
                 .with_context(|| format!("zip start {}", rel_str))?;
             let mut f = File::open(entry.path())?;

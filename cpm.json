@@ -1,0 +1,13 @@
+{
+    "version": "0.1.0",
+    "description": "Local preloader & tooling around CPM.cmake (local dev build)",
+    "homepage": "https://github.com/cpm-cmake/CPM.cmake",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "file:///W:/projects/cpm-cli/target/release/cpm.exe",
+            "hash": "8fd0abe4d3db7f9fb490f853366f803018008f176a3c9531a53a365a7666ff59",
+            "bin": "cpm.exe"
+        }
+    }
+}

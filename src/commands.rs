@@ -1315,12 +1315,31 @@ pub fn env(export: bool) -> Result<()> {
 
     if export {
         println!();
-        println!("# append to your shell rc:");
-        println!("export CPM_SOURCE_CACHE=\"{}\"", sc.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "$HOME/cmake/cpm_cache".into()));
-        if let Some(p) = &pre {
-            println!("export CPM_PRELOAD=\"{}\"", p.display());
+        let cache = sc
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "$env:USERPROFILE\\cmake\\cpm_cache".to_string()
+                } else {
+                    "$HOME/cmake/cpm_cache".to_string()
+                }
+            });
+        if cfg!(windows) {
+            println!("# PowerShell — run once, or add to your $PROFILE:");
+            println!("$env:CPM_SOURCE_CACHE = \"{}\"", cache);
+            if let Some(p) = &pre {
+                println!("$env:CPM_PRELOAD = \"{}\"", p.display());
+            }
+            println!("$env:CPM_HOME = \"{}\"", home.display());
+        } else {
+            println!("# append to your shell rc:");
+            println!("export CPM_SOURCE_CACHE=\"{}\"", cache);
+            if let Some(p) = &pre {
+                println!("export CPM_PRELOAD=\"{}\"", p.display());
+            }
+            println!("export CPM_HOME=\"{}\"", home.display());
         }
-        println!("export CPM_HOME=\"{}\"", home.display());
     }
     Ok(())
 }

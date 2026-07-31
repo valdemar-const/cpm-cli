@@ -16,10 +16,18 @@ if(NOT DEFINED CPM_PRELOAD AND DEFINED ENV{CPM_PRELOAD})
 endif()
 
 # Patch application: a command prefix that takes ONE patch file as its last arg.
-# Default works on Linux/macOS. On Windows override in configure.cmake, e.g.
-#   set(CPM_PATCH_COMMAND "${Python3_EXECUTABLE} -m patch -p1" CACHE STRING "" FORCE)
-set(CPM_PATCH_COMMAND "patch -p1 -i" CACHE STRING
+# Default is chosen by platform at configure time: `patch -p1 -i` on Unix (always
+# present), `git apply` on Windows (where `patch` is rarely installed but `git`
+# always is — git is a prerequisite of this tool). Override BEFORE including this
+# file, e.g. set(CPM_PATCH_COMMAND "${Python3_EXECUTABLE} -m patch -p1" CACHE STRING "" FORCE)
+if(WIN32)
+  set(_cpm_patch_default "git apply")
+else()
+  set(_cpm_patch_default "patch -p1 -i")
+endif()
+set(CPM_PATCH_COMMAND "${_cpm_patch_default}" CACHE STRING
     "cpm: command prefix that applies ONE .patch file (the file is appended as the last arg)")
+unset(_cpm_patch_default)
 set(CPM_PATCH_PREFIX "${PROJECT_SOURCE_DIR}/build/patches" CACHE PATH
     "cpm: root directory of patch files (looked up as <CPM_PATCH_PREFIX>/<archive-base>/<name>.patch)")
 
@@ -128,7 +136,16 @@ function(cpm_resolve_fallback key)
       elseif(_tier STREQUAL "loc")
         if(EXISTS "${_url}")
           message(STATUS "cpm/fallback[${_pkg}] local: ${_url}")
-          list(APPEND _args URL "file://${_url}")
+          # Build a valid file:// URL. Windows drive-letter paths (C:/...) need an
+          # extra leading slash -> file:///C:/... ; Unix paths already start with /
+          # so file://${_url} is already file:///home/...
+          if("${_url}" MATCHES "^([a-zA-Z]):[\\/]")
+            set(_loc_url "file:///${_url}")
+          else()
+            set(_loc_url "file://${_url}")
+          endif()
+          list(APPEND _args URL "${_loc_url}")
+          unset(_loc_url)
           if(NOT (_hash STREQUAL ""))
             list(APPEND _args URL_HASH "${_hash}")
           endif()
