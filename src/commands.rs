@@ -9,6 +9,7 @@ use crate::archive;
 use crate::config;
 use crate::deps::{self, Dep};
 use crate::git;
+use crate::source;
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -134,11 +135,30 @@ fn human_bytes(b: u64) -> String {
 
 // ---- add -------------------------------------------------------------------
 
+/// Resolve the package version for a fetch source: explicit `--version` wins,
+/// otherwise derive a semver from the archive's basename. Errors if neither.
+fn resolve_fetch_version(version_override: Option<&str>, url: &str) -> Result<String> {
+    if let Some(v) = version_override {
+        return canonicalize_version(v).ok_or_else(|| {
+            anyhow::anyhow!("`--version {v}` is not canonical MAJOR.MINOR.PATCH (numeric dot-parts only)")
+        });
+    }
+    let stem = source::url_stem(url);
+    if let Some(v) = extract_semver(stem) {
+        return Ok(v);
+    }
+    anyhow::bail!(
+        "could not derive a version (MAJOR.MINOR.PATCH) from `{stem}`.\n\
+         pass it explicitly: --version X.Y.Z"
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn add(
     name: &str,
     url: &str,
-    tag: &str,
+    tag: Option<&str>,
+    kind: source::Kind,
     archive_override: Option<&str>,
     version_override: Option<&str>,
     force_commit: bool,
@@ -148,36 +168,78 @@ pub fn add(
     let preload = config::preload_dir()?;
     let mut reg = deps::load()?;
 
-    let version = resolve_version(version_override, tag)?;
+    let git_tag: Option<&str> = tag;
+    let version = match kind {
+        source::Kind::Git => {
+            let t = git_tag.ok_or_else(|| {
+                anyhow::anyhow!("git source needs a tag/branch/commit (positional arg 3)")
+            })?;
+            resolve_version(version_override, t)?
+        }
+        source::Kind::Fetch => {
+            if git_tag.is_some() {
+                println!("(ignoring tag for --kind=fetch)");
+            }
+            resolve_fetch_version(version_override, url)?
+        }
+    };
+    let existing = reg.pick(name, Some(&version)).cloned();
     let archive = archive_override
         .map(|s| s.to_string())
+        .or_else(|| existing.as_ref().map(|d| d.archive.clone()))
         .unwrap_or_else(|| default_archive_name(name, &version));
     let archive_path = preload.join(&archive);
 
     if archive_path.exists() && !force {
-        // Tarball already present: trust it, just attach the source (url+tag) to
-        // the registry entry — no re-download, no repack.
+        // Archive already present: by the source-equivalence invariant we trust
+        // it. For git we record/refresh the url+tag provenance; for fetch there
+        // is nothing to store (the archive is the snapshot). No re-download.
         let sha = archive::sha256_file(&archive_path)?;
         let size = fs::metadata(&archive_path)?.len();
-        let submodules = reg.pick(name, Some(&version)).and_then(|d| d.submodules);
-        reg.upsert(Dep {
-            name: name.to_ascii_lowercase(),
-            url: Some(url.to_string()),
-            tag: Some(tag.to_string()),
-            archive: archive.clone(),
-            version: Some(version.clone()),
-            sha256: Some(sha),
-            added_at: Some(now_rfc3339()),
-            submodules,
-        });
-        deps::save(&reg)?;
-        println!(
-            "attached source to existing {} ({})",
-            archive,
-            human_bytes(size)
-        );
-        println!("  {} @ {}", url, tag);
-        println!("  (pass --force to re-fetch and repack)");
+        let key = deps::version_key(&version);
+        let has_entry = slot_of(&reg, name, key).is_some();
+        match kind {
+            source::Kind::Git => {
+                let t = git_tag.unwrap();
+                if !attach_in_place(&mut reg, name, key, url, t, &sha) {
+                    let submodules = existing.as_ref().and_then(|d| d.submodules);
+                    reg.upsert(Dep {
+                        name: name.to_ascii_lowercase(),
+                        url: Some(url.to_string()),
+                        tag: Some(t.to_string()),
+                        archive: archive.clone(),
+                        version: Some(version.clone()),
+                        sha256: Some(sha),
+                        added_at: Some(now_rfc3339()),
+                        submodules,
+                    });
+                }
+                deps::save(&reg)?;
+                println!("{} already present ({}) — source recorded", archive, human_bytes(size));
+                println!("  {} @ {}", url, t);
+                println!("  (pass --force to re-fetch and repack)");
+            }
+            source::Kind::Fetch => {
+                if !has_entry {
+                    reg.upsert(Dep {
+                        name: name.to_ascii_lowercase(),
+                        url: None,
+                        tag: None,
+                        archive: archive.clone(),
+                        version: Some(version.clone()),
+                        sha256: Some(sha),
+                        added_at: Some(now_rfc3339()),
+                        submodules: None,
+                    });
+                    deps::save(&reg)?;
+                    println!("registered {} ({})", archive, human_bytes(size));
+                } else {
+                    deps::save(&reg)?;
+                    println!("{} already present ({}) — kept", archive, human_bytes(size));
+                }
+                println!("  (pass --force to re-fetch and repack)");
+            }
+        }
         return Ok(());
     }
     if archive_path.exists() {
@@ -185,40 +247,47 @@ pub fn add(
     }
 
     let tmp_root = config::tmp_dir()?;
-    let clone_dir = tmp_root.join(format!(
+    let work = tmp_root.join(format!(
         "{}-{}",
         sanitize_fs(name),
-        sanitize_fs(tag)
+        sanitize_fs(&version)
     ));
-    if clone_dir.exists() {
-        let _ = fs::remove_dir_all(&clone_dir);
-    }
 
-    println!("cloning {} @ {} ...", url, tag);
-    git::shallow_clone(url, tag, &clone_dir, force_commit)?;
+    println!("acquiring {} ({:?}) ...", url, kind);
+    let src_root = source::acquire(url, kind, git_tag, force_commit, &work)?;
 
-    let has_submodules = clone_dir.join(".gitmodules").exists();
+    let has_submodules = src_root.join(".gitmodules").exists();
 
     println!("cleaning VCS metadata ...");
-    git::clean_vcs(&clone_dir)?;
+    git::clean_vcs(&src_root)?;
 
     println!("dereferencing symlinks ...");
-    git::dereference_symlinks(&clone_dir)?;
+    git::dereference_symlinks(&src_root)?;
 
     println!("packing {} ...", archive);
-    archive::zip_dir(&clone_dir, &archive_path)?;
+    archive::zip_dir(&src_root, &archive_path)?;
     let size = fs::metadata(&archive_path)?.len();
     let sha = archive::sha256_file(&archive_path)?;
 
-    // remove temp clone
-    let _ = fs::remove_dir_all(&clone_dir);
+    // remove temp work tree
+    let _ = fs::remove_dir_all(&work);
 
+    // keep a pre-existing verbatim version (e.g. "3.4") if any, so repacking
+    // doesn't rewrite it to the canonical form ("3.4.0").
+    let store_version = existing
+        .as_ref()
+        .and_then(|d| d.version.clone())
+        .unwrap_or_else(|| version.clone());
+    let (surl, stag) = match kind {
+        source::Kind::Git => (Some(url.to_string()), git_tag.map(|s| s.to_string())),
+        source::Kind::Fetch => (None, None),
+    };
     reg.upsert(Dep {
         name: name.to_ascii_lowercase(),
-        url: Some(url.to_string()),
-        tag: Some(tag.to_string()),
+        url: surl,
+        tag: stag,
         archive,
-        version: Some(version),
+        version: Some(store_version),
         sha256: Some(sha),
         added_at: Some(now_rfc3339()),
         submodules: Some(has_submodules),
@@ -239,6 +308,37 @@ fn sanitize_fs(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
         .collect()
+}
+
+/// Set url+tag and refresh sha/added_at on an existing pantry entry in place,
+/// preserving its version and archive name. Returns false if no matching entry.
+fn attach_in_place(
+    reg: &mut deps::Registry,
+    name: &str,
+    key: (u64, u64, u64),
+    url: &str,
+    tag: &str,
+    sha: &str,
+) -> bool {
+    for d in &mut reg.deps {
+        if d.name.eq_ignore_ascii_case(name)
+            && d.version.as_deref().map(deps::version_key).as_ref() == Some(&key)
+        {
+            d.url = Some(url.to_string());
+            d.tag = Some(tag.to_string());
+            d.sha256 = Some(sha.to_string());
+            d.added_at = Some(now_rfc3339());
+            return true;
+        }
+    }
+    false
+}
+
+/// First pantry entry matching `name` + numeric version key (index), or None.
+fn slot_of(reg: &deps::Registry, name: &str, key: (u64, u64, u64)) -> Option<usize> {
+    reg.deps.iter().position(|d| {
+        d.name.eq_ignore_ascii_case(name) && d.version.as_deref().map(deps::version_key).as_ref() == Some(&key)
+    })
 }
 
 // ---- fetch -----------------------------------------------------------------
@@ -266,7 +366,8 @@ pub fn fetch(force: bool) -> Result<()> {
         add(
             &dep.name,
             &url,
-            &tag,
+            Some(&tag),
+            source::Kind::Git,
             Some(&dep.archive),
             dep.version.as_deref(),
             git::looks_like_commit(&tag),
@@ -356,7 +457,8 @@ fn import_force(files: &[String]) -> Result<()> {
                 add(
                     &name,
                     &url,
-                    &tag,
+                    Some(&tag),
+                    source::Kind::Git,
                     Some(fname),
                     Some(&version),
                     git::looks_like_commit(&tag),
@@ -470,6 +572,157 @@ pub fn show(name: &str, with_hash: bool) -> Result<()> {
         }
     }
     println!(")");
+    Ok(())
+}
+
+// ---- info ------------------------------------------------------------------
+
+/// Short summary of a dependency: every archived version and, for each, its
+/// load sources (the git upstream and the local archive). The `git remote -v`
+/// equivalent.
+pub fn info(name: &str) -> Result<()> {
+    let reg = deps::load()?;
+    let all = reg.versions(name);
+    if all.is_empty() {
+        bail!("unknown dep '{name}'");
+    }
+    let preload = config::preload_dir_opt();
+    let canon = all[0].name.clone();
+    let n = all.len();
+
+    println!("{canon} ({n} version{})\n", if n == 1 { "" } else { "s" });
+
+    for dep in &all {
+        let version = dep.version.clone().unwrap_or_else(|| "?".into());
+        println!("  {version}");
+
+        match (dep.url.as_deref(), dep.tag.as_deref()) {
+            (Some(u), Some(t)) => println!("    git  {u} @ {t}"),
+            _ => println!(
+                "    git  (none — `cpm source add {canon} <url> <tag> --version {version}`)"
+            ),
+        }
+
+        let (size, status) = match &preload {
+            Some(p) => {
+                let path = p.join(&dep.archive);
+                if path.exists() {
+                    let sz = fs::metadata(&path).map(|m| human_bytes(m.len())).unwrap_or_default();
+                    (sz, "present".to_string())
+                } else {
+                    ("-".into(), "MISSING".to_string())
+                }
+            }
+            None => ("?".into(), "no CPM_PRELOAD".to_string()),
+        };
+        let sha_short: String = dep
+            .sha256
+            .as_deref()
+            .map(|s| s.chars().take(12).collect())
+            .unwrap_or_else(|| "no hash".into());
+        println!(
+            "    loc  {}  {}  sha {}  [{}]",
+            dep.archive, size, sha_short, status
+        );
+        if dep.submodules == Some(true) {
+            println!("         (source tree uses git submodules)");
+        }
+        println!();
+    }
+    Ok(())
+}
+
+// ---- source add / rm -------------------------------------------------------
+
+/// Attach a git source (url+tag) to an existing pantry entry. Never fetches —
+/// the archive must already be on disk. Errors if the entry or archive is
+/// missing (use `cpm add` to fetch a new dep first).
+pub fn source_add(
+    name: &str,
+    url: &str,
+    tag: &str,
+    version_override: Option<&str>,
+) -> Result<()> {
+    let preload = config::preload_dir()?;
+    let mut reg = deps::load()?;
+
+    let version = resolve_version(version_override, tag)?;
+    let key = deps::version_key(&version);
+
+    let archive = match reg.deps.iter().find(|d| {
+        d.name.eq_ignore_ascii_case(name)
+            && d.version.as_deref().map(deps::version_key).as_ref() == Some(&key)
+    }) {
+        Some(d) => d.archive.clone(),
+        None => bail!(
+            "no pantry entry for {name} {version}.\n\
+             fetch it first: cpm add {name} {url} {tag}"
+        ),
+    };
+    let archive_path = preload.join(&archive);
+    if !archive_path.exists() {
+        bail!(
+            "archive `{archive}` missing in {} — re-fetch: cpm add {name} {url} {tag} --force",
+            preload.display()
+        );
+    }
+    let sha = archive::sha256_file(&archive_path)?;
+    let size = fs::metadata(&archive_path)?.len();
+
+    attach_in_place(&mut reg, name, key, url, tag, &sha);
+    deps::save(&reg)?;
+
+    println!("source added: {} ({})", archive, human_bytes(size));
+    println!("  {} @ {}", url, tag);
+    Ok(())
+}
+
+/// Remove the git source (url+tag) from an entry, leaving it loc-only.
+pub fn source_rm(name: &str, version_override: Option<&str>) -> Result<()> {
+    let mut reg = deps::load()?;
+    let all = reg.versions(name);
+    if all.is_empty() {
+        bail!("unknown dep '{name}'");
+    }
+
+    let key = match version_override {
+        Some(v) => {
+            let c = canonicalize_version(v).ok_or_else(|| {
+                anyhow::anyhow!("`--version {v}` is not canonical MAJOR.MINOR.PATCH")
+            })?;
+            deps::version_key(&c)
+        }
+        None => {
+            if all.len() == 1 {
+                deps::version_key(all[0].version.as_deref().unwrap_or("0"))
+            } else {
+                let vers: Vec<_> = all
+                    .iter()
+                    .map(|d| d.version.clone().unwrap_or_default())
+                    .collect();
+                bail!(
+                    "{name} has {} versions ({}); pass --version",
+                    all.len(),
+                    vers.join(", ")
+                );
+            }
+        }
+    };
+
+    let idx = slot_of(&reg, name, key).ok_or_else(|| anyhow::anyhow!("no entry for {name}"))?;
+    let dep = &mut reg.deps[idx];
+    if dep.url.is_none() && dep.tag.is_none() {
+        println!(
+            "{} {} already has no source (loc-only)",
+            dep.name,
+            dep.version.as_deref().unwrap_or("?")
+        );
+        return Ok(());
+    }
+    dep.url = None;
+    dep.tag = None;
+    deps::save(&reg)?;
+    println!("source removed (now loc-only)");
     Ok(())
 }
 

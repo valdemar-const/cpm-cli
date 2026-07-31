@@ -5,8 +5,16 @@ mod config;
 mod deps;
 mod gen;
 mod git;
+mod source;
 
 use clap::{Parser, Subcommand};
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum KindArg {
+    Auto,
+    Git,
+    Fetch,
+}
 
 #[derive(Parser)]
 #[command(
@@ -23,21 +31,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Shallow-clone a dependency, strip VCS metadata, pack it into $CPM_PRELOAD.
+    /// Acquire a dependency into $CPM_PRELOAD: clone (git) or download/extract/copy
+    /// (fetch), then clean, dereference symlinks, and pack under <name>-<ver>.zip.
     Add {
         /// CPM/CPMAddPackage package name (also the find_package name).
         name: String,
-        /// Git URL (https://github.com/...git).
+        /// Git URL (git), or an archive URI / local path (fetch).
         url: String,
-        /// Branch, tag, or (with --commit) a commit hash.
-        tag: String,
+        /// Branch, tag, or (with --commit) commit hash. Required for --kind=git;
+        /// ignored for --kind=fetch.
+        tag: Option<String>,
+        /// Source kind: `git` clones, `fetch` downloads/extracts/copies. `auto`
+        /// infers from the URL/path.
+        #[arg(long, value_enum, default_value = "auto")]
+        kind: KindArg,
         /// Override archive filename (default: <name>-<version>.zip).
         #[arg(long)]
         archive: Option<String>,
-        /// Override VERSION reported by `cpm show`.
+        /// Override VERSION reported by `cpm show` (required for fetch when the
+        /// archive basename has no semver).
         #[arg(long)]
         version: Option<String>,
-        /// Treat `tag` as a commit hash.
+        /// Treat `tag` as a commit hash (git only).
         #[arg(long)]
         commit: bool,
         /// Overwrite an existing archive.
@@ -64,6 +79,15 @@ enum Cmd {
         /// Include a URL_HASH (SHA256) line.
         #[arg(long)]
         hash: bool,
+    },
+    /// Show a dependency summary: every version and its load sources (git/loc).
+    Info {
+        name: String,
+    },
+    /// Manage the git source of a pantry entry (cf. `git remote`).
+    Source {
+        #[command(subcommand)]
+        cmd: SourceCmd,
     },
     /// Download official CPM.cmake + get_cpm.cmake into the cpm data dir.
     Bootstrap {
@@ -120,6 +144,24 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum SourceCmd {
+    /// Attach a git source (url+tag) to an existing pantry entry (no fetch).
+    Add {
+        name: String,
+        url: String,
+        tag: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Remove the git source from an entry (back to loc-only).
+    Rm {
+        name: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -127,23 +169,39 @@ fn main() -> anyhow::Result<()> {
             name,
             url,
             tag,
+            kind,
             archive,
             version,
             commit,
             force,
-        } => commands::add(
-            &name,
-            &url,
-            &tag,
-            archive.as_deref(),
-            version.as_deref(),
-            commit,
-            force,
-        ),
+        } => {
+            let kind = match kind {
+                KindArg::Auto => source::detect_kind(&url),
+                KindArg::Git => source::Kind::Git,
+                KindArg::Fetch => source::Kind::Fetch,
+            };
+            commands::add(
+                &name,
+                &url,
+                tag.as_deref(),
+                kind,
+                archive.as_deref(),
+                version.as_deref(),
+                commit,
+                force,
+            )
+        }
         Cmd::List => commands::list(),
         Cmd::Fetch { force } => commands::fetch(force),
         Cmd::Import { force } => commands::import(force),
         Cmd::Show { name, hash } => commands::show(&name, hash),
+        Cmd::Info { name } => commands::info(&name),
+        Cmd::Source { cmd } => match cmd {
+            SourceCmd::Add { name, url, tag, version } => {
+                commands::source_add(&name, &url, &tag, version.as_deref())
+            }
+            SourceCmd::Rm { name, version } => commands::source_rm(&name, version.as_deref()),
+        },
         Cmd::Bootstrap { version, latest } => bootstrap::run(version.as_deref(), latest),
         Cmd::Update { global, check } => bootstrap::update(global, check),
         Cmd::Env { export } => commands::env(export),

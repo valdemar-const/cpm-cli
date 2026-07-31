@@ -59,28 +59,34 @@ impl Registry {
         v
     }
 
-    /// Pick a single entry: exact `version` if given (no freshest fallback — a
-    /// missing pinned version must NOT silently serve another), else freshest.
+    /// Pick a single entry: a `version` if given (matched by numeric key, so
+    /// "3.4" and "3.4.0" are the same — but a genuinely different version is
+    /// NOT silently replaced by the freshest), else the freshest.
     pub fn pick(&self, name: &str, version: Option<&str>) -> Option<&Dep> {
         let all = self.versions(name);
         if all.is_empty() {
             return None;
         }
         match version {
-            Some(want) => all.iter().find(|d| d.version.as_deref() == Some(want)).copied(),
+            Some(want) => {
+                let key = version_key(want);
+                all.iter()
+                    .find(|d| d.version.as_deref().map(version_key).as_ref() == Some(&key))
+                    .copied()
+            }
             None => Some(all[0]),
         }
     }
 
-    /// Insert or replace by (name, version).
+    /// Insert or replace by (name, numeric version key) — so canonicalising a
+    /// version ("3.4" → "3.4.0") updates the same slot instead of spawning a
+    /// duplicate.
     pub fn upsert(&mut self, dep: Dep) {
         let name = dep.name.clone();
-        let ver = dep.version.clone();
-        if let Some(slot) = self
-            .deps
-            .iter_mut()
-            .find(|d| d.name.eq_ignore_ascii_case(&name) && d.version == ver)
-        {
+        let key = dep.version.as_deref().map(version_key);
+        if let Some(slot) = self.deps.iter_mut().find(|d| {
+            d.name.eq_ignore_ascii_case(&name) && d.version.as_deref().map(version_key) == key
+        }) {
             *slot = dep;
         } else {
             self.deps.push(dep);

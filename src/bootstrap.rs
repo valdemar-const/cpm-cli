@@ -44,7 +44,7 @@ pub fn run(version: Option<&str>, latest: bool) -> Result<()> {
         "https://github.com/cpm-cmake/CPM.cmake/releases/download/v{ver}/CPM.cmake"
     );
     println!("downloading CPM.cmake v{ver} ...");
-    download(&url, &cmake_path)?;
+    crate::source::download(&url, &cmake_path)?;
 
     let hash = crate::archive::sha256_file(&cmake_path)?;
     let get = GET_CPM_TEMPLATE.replace("__VER__", &ver).replace("__HASH__", &hash);
@@ -58,14 +58,6 @@ pub fn run(version: Option<&str>, latest: bool) -> Result<()> {
     println!("CPM.cmake v{ver} installed at {}", dir.display());
     println!("  CPM.cmake     {}", cmake_path.display());
     println!("  get_cpm.cmake {}", dir.join("get_cpm.cmake").display());
-    Ok(())
-}
-
-fn download(url: &str, dst: &Path) -> Result<()> {
-    let resp = ureq::get(url).set("User-Agent", "cpm-cli").call()?;
-    let mut file = std::fs::File::create(dst)?;
-    let mut reader = resp.into_reader();
-    std::io::copy(&mut reader, &mut file)?;
     Ok(())
 }
 
@@ -184,7 +176,7 @@ fn update_project(latest: &str, check: bool) -> Result<()> {
         "https://github.com/cpm-cmake/CPM.cmake/releases/download/v{latest}/CPM.cmake"
     );
     println!("downloading {url}");
-    download(&url, &cpm_cmake)?;
+    crate::source::download(&url, &cpm_cmake)?;
     let hash = crate::archive::sha256_file(&cpm_cmake)?;
 
     println!("CPM.cmake {current} -> {latest} (sha256 {hash})");
@@ -202,7 +194,7 @@ fn download_cmake_to_tmp(version: &str) -> Result<String> {
         "https://github.com/cpm-cmake/CPM.cmake/releases/download/v{version}/CPM.cmake"
     );
     println!("downloading CPM.cmake v{version} ...");
-    download(&url, &dst)?;
+    crate::source::download(&url, &dst)?;
     let hash = crate::archive::sha256_file(&dst)?;
     let _ = std::fs::remove_file(&dst);
     Ok(hash)
