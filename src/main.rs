@@ -40,9 +40,6 @@ enum Cmd {
         /// Treat `tag` as a commit hash.
         #[arg(long)]
         commit: bool,
-        /// Dereference symlinks into real files/dirs (improves portability, bloats size).
-        #[arg(long)]
-        dereference: bool,
         /// Overwrite an existing archive.
         #[arg(long)]
         force: bool,
@@ -127,7 +124,6 @@ fn main() -> anyhow::Result<()> {
             archive,
             version,
             commit,
-            dereference,
             force,
         } => commands::add(
             &name,
@@ -136,7 +132,6 @@ fn main() -> anyhow::Result<()> {
             archive.as_deref(),
             version.as_deref(),
             commit,
-            dereference,
             force,
         ),
         Cmd::List => commands::list(),

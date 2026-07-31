@@ -16,25 +16,88 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// Derive a clean version string from a tag (handles `vX`, `name-X`, `release-X`).
-pub fn strip_version(tag: &str, name: &str) -> String {
-    let lower = tag.to_ascii_lowercase();
-    let name_prefix = format!("{}-", name.to_ascii_lowercase());
-    if lower.starts_with(&name_prefix) {
-        tag[name_prefix.len()..].to_string()
-    } else if lower.starts_with("release-") {
-        tag["release-".len()..].to_string()
-    } else if lower.starts_with('v')
-        && lower[1..].chars().next().map_or(false, |c| c.is_ascii_digit())
-    {
-        tag[1..].to_string()
-    } else {
-        tag.to_string()
+/// Normalise a version to canonical MAJOR.MINOR.PATCH (numeric dot-parts padded
+/// / truncated to three). None if any part is non-numeric.
+pub fn canonicalize_version(s: &str) -> Option<String> {
+    let mut comps: Vec<&str> = Vec::new();
+    for part in s.split('.') {
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        comps.push(part);
     }
+    if comps.is_empty() {
+        return None;
+    }
+    while comps.len() < 3 {
+        comps.push("0");
+    }
+    Some(comps.iter().take(3).copied().collect::<Vec<_>>().join("."))
 }
 
-fn default_archive_name(name: &str, tag: &str) -> String {
-    format!("{}-{}.zip", name, strip_version(tag, name))
+/// Extract a canonical semver from an arbitrary git tag.
+///
+/// Handles `v1.0.0`, `boost-1.90.0`, `boost-version-1.90` (any prefix is fine
+/// provided a MAJOR.MINOR[.PATCH] numeric run exists). Requires at least
+/// MAJOR.MINOR so numbers embedded in a project name aren't mistaken for it.
+/// Returns None for dash-separated tags like `VER-2-14-1` — the caller must
+/// then pass `--version` explicitly.
+pub fn extract_semver(tag: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            let mut j = i;
+            let mut comps = 0usize;
+            loop {
+                let b = j;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j == b {
+                    break;
+                }
+                comps += 1;
+                if j < bytes.len() && bytes[j] == b'.' {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            if comps >= 2 {
+                return canonicalize_version(tag[start..j].trim_end_matches('.'));
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Resolve the package version: explicit `--version` wins (and is canonicalised),
+/// otherwise derive from the tag. Errors when neither yields a semver.
+pub fn resolve_version(version_override: Option<&str>, tag: &str) -> Result<String> {
+    if let Some(v) = version_override {
+        return canonicalize_version(v).ok_or_else(|| {
+            anyhow::anyhow!(
+                "`--version {v}` is not canonical MAJOR.MINOR.PATCH (numeric dot-parts only)"
+            )
+        });
+    }
+    extract_semver(tag).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not derive a semver (MAJOR.MINOR.PATCH) from tag `{tag}`\n\
+             this happens with non-standard tag formats (e.g. `VER-2-14-1`).\n\
+             pass the version explicitly: --version X.Y.Z"
+        )
+    })
+}
+
+/// `<lowercase(name)>-<canonical-version>.zip`
+fn default_archive_name(name: &str, version: &str) -> String {
+    format!("{}-{}.zip", name.to_ascii_lowercase(), version)
 }
 
 fn human_bytes(b: u64) -> String {
@@ -62,16 +125,16 @@ pub fn add(
     archive_override: Option<&str>,
     version_override: Option<&str>,
     force_commit: bool,
-    dereference: bool,
     force: bool,
 ) -> Result<()> {
     config::ensure_dirs()?;
     let preload = config::preload_dir()?;
     let mut reg = deps::load()?;
 
+    let version = resolve_version(version_override, tag)?;
     let archive = archive_override
         .map(|s| s.to_string())
-        .unwrap_or_else(|| default_archive_name(name, tag));
+        .unwrap_or_else(|| default_archive_name(name, &version));
     let archive_path = preload.join(&archive);
 
     if archive_path.exists() {
@@ -103,10 +166,8 @@ pub fn add(
     println!("cleaning VCS metadata ...");
     git::clean_vcs(&clone_dir)?;
 
-    if dereference {
-        println!("dereferencing symlinks ...");
-        git::dereference_symlinks(&clone_dir)?;
-    }
+    println!("dereferencing symlinks ...");
+    git::dereference_symlinks(&clone_dir)?;
 
     println!("packing {} ...", archive);
     archive::zip_dir(&clone_dir, &archive_path)?;
@@ -116,17 +177,13 @@ pub fn add(
     // remove temp clone
     let _ = fs::remove_dir_all(&clone_dir);
 
-    let version = version_override
-        .map(|s| s.to_string())
-        .or_else(|| Some(strip_version(tag, name)));
-
     reg.deps.insert(
         name.to_string(),
         Dep {
             url: url.to_string(),
             tag: tag.to_string(),
             archive,
-            version,
+            version: Some(version),
             sha256: Some(sha),
             added_at: Some(now_rfc3339()),
             submodules: Some(has_submodules),
@@ -172,7 +229,6 @@ pub fn fetch(force: bool) -> Result<()> {
             Some(&dep.archive),
             dep.version.as_deref(),
             git::looks_like_commit(&dep.tag),
-            false,
             true,
         )?;
     }
@@ -407,4 +463,66 @@ pub fn env(export: bool) -> Result<()> {
         println!("export CPM_HOME=\"{}\"", home.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_handles_padding_and_truncation() {
+        assert_eq!(canonicalize_version("1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(canonicalize_version("1.2").as_deref(), Some("1.2.0"));
+        assert_eq!(canonicalize_version("1").as_deref(), Some("1.0.0"));
+        assert_eq!(canonicalize_version("1.2.3.4").as_deref(), Some("1.2.3"));
+        assert_eq!(canonicalize_version("1.92.801").as_deref(), Some("1.92.801"));
+        // non-numeric / prefixed => rejected
+        assert_eq!(canonicalize_version("1.0.0-rc1"), None);
+        assert_eq!(canonicalize_version("v1.0"), None);
+        assert_eq!(canonicalize_version(""), None);
+    }
+
+    #[test]
+    fn extract_semver_from_common_tag_shapes() {
+        // v-prefix
+        assert_eq!(extract_semver("v1.0.0").as_deref(), Some("1.0.0"));
+        assert_eq!(extract_semver("v6.2").as_deref(), Some("6.2.0"));
+        // name-prefix, with or without an inner "version"
+        assert_eq!(extract_semver("boost-1.90.0").as_deref(), Some("1.90.0"));
+        assert_eq!(extract_semver("boost-version-1.90").as_deref(), Some("1.90.0"));
+        // bare
+        assert_eq!(extract_semver("1.92.801").as_deref(), Some("1.92.801"));
+        assert_eq!(extract_semver("10.2.1").as_deref(), Some("10.2.1"));
+        // number embedded in name must not win
+        assert_eq!(extract_semver("libfoo2-1.0.0").as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn extract_semver_rejects_non_semver_tags() {
+        // dash-separated / non-standard => no derivation
+        assert_eq!(extract_semver("VER-2-14-1"), None);
+        assert_eq!(extract_semver("2024-01-15"), None);
+        assert_eq!(extract_semver("main"), None);
+        assert_eq!(extract_semver("v5"), None);
+    }
+
+    #[test]
+    fn resolve_version_requires_explicit_when_tag_opaque() {
+        // explicit override canonicalises
+        assert_eq!(
+            resolve_version(Some("2.14.1"), "VER-2-14-1").unwrap(),
+            "2.14.1"
+        );
+        assert_eq!(resolve_version(Some("6.2"), "6").unwrap(), "6.2.0");
+        // opaque tag without override => error
+        assert!(resolve_version(None, "VER-2-14-1").is_err());
+        // bad override => error
+        assert!(resolve_version(Some("v1"), "v1").is_err());
+    }
+
+    #[test]
+    fn archive_name_is_lowercase_name_plus_semver() {
+        assert_eq!(default_archive_name("imgui_bundle", "1.92.801"), "imgui_bundle-1.92.801.zip");
+        assert_eq!(default_archive_name("ImGuiBundle", "1.0.0"), "imguibundle-1.0.0.zip");
+    }
 }

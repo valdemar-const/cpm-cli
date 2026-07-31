@@ -102,8 +102,9 @@ pub fn clean_vcs(root: &Path) -> Result<()> {
         let name = entry.file_name().to_string_lossy();
         let is_dir = entry.file_type().is_dir();
         let is_file = entry.file_type().is_file();
-        if is_dir && VCS_DIRS.contains(&&*name) {
-            to_remove.push((entry.path().to_path_buf(), true));
+        if VCS_DIRS.contains(&&*name) {
+            // matches a dir (.git/, .svn/) OR a file (.git gitlink inside a submodule)
+            to_remove.push((entry.path().to_path_buf(), is_dir));
         } else if is_file && VCS_FILES.contains(&&*name) {
             to_remove.push((entry.path().to_path_buf(), false));
         }
