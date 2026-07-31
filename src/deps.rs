@@ -59,18 +59,17 @@ impl Registry {
         v
     }
 
-    /// Pick a single entry: exact `version` if given, else the freshest.
+    /// Pick a single entry: exact `version` if given (no freshest fallback — a
+    /// missing pinned version must NOT silently serve another), else freshest.
     pub fn pick(&self, name: &str, version: Option<&str>) -> Option<&Dep> {
         let all = self.versions(name);
         if all.is_empty() {
             return None;
         }
-        if let Some(want) = version {
-            if let Some(exact) = all.iter().find(|d| d.version.as_deref() == Some(want)) {
-                return Some(*exact);
-            }
+        match version {
+            Some(want) => all.iter().find(|d| d.version.as_deref() == Some(want)).copied(),
+            None => Some(all[0]),
         }
-        Some(all[0])
     }
 
     /// Insert or replace by (name, version).
