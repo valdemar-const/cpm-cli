@@ -125,6 +125,15 @@ function(cpm_resolve_fallback key)
 
       if(_try)
         CPMAddPackage(${_args})
+        # Expose the fetched source dir to the POST hook — essential for
+        # DOWNLOAD_ONLY glue (header-only targets) and for deps that need a
+        # custom build (ExternalProject/execute_process + IMPORTED targets).
+        # CPM stores it as a CACHE INTERNAL var; fall back to the per-package var.
+        set(_cpm_src "${CPM_PACKAGE_${_pkg}_SOURCE_DIR}")
+        if(_cpm_src STREQUAL "")
+          set(_cpm_src "${${_pkg}_SOURCE_DIR}")
+        endif()
+        set("${_pkg}_SOURCE_DIR" "${_cpm_src}")
         set(_ok TRUE)
         break()
       endif()

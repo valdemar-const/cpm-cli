@@ -61,6 +61,9 @@ struct DepSpec {
     post: Option<String>,
     /// synthetic, target-only package (no source tiers).
     no_source: Option<bool>,
+    /// download-only: fetch the source but don't build it; you declare the
+    /// target(s) yourself in `post` (header-only, non-CMake, custom builds).
+    download_only: Option<bool>,
     /// explicit ordered candidate list (replaces synthesised tiers).
     source: Option<Vec<Candidate>>,
 }
@@ -307,6 +310,11 @@ pub fn generate(project: &str, rel: &str) -> Result<()> {
                 }
                 pkg_opts.push(t);
             }
+        }
+        if spec.download_only == Some(true)
+            && !pkg_opts.iter().any(|o| o == "DOWNLOAD_ONLY")
+        {
+            pkg_opts.push("DOWNLOAD_ONLY".into());
         }
         // patches -> PATCH_COMMAND ${CPM_PATCH_COMMAND} <f1> && ... (package level)
         if let Some(patches) = &spec.patches {
