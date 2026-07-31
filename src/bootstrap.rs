@@ -69,19 +69,31 @@ fn download(url: &str, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Rewrite the CPM.cmake version pinned in the tool's own source tree
-/// (`src/get_cpm_default.cmake` + `DEFAULT_CPM_VERSION` in `src/config.rs`)
-/// to the latest stable release. Run from a checkout, then rebuild.
-pub fn update(check: bool) -> Result<()> {
+/// `cpm update` — refresh the vendored CPM.cmake to the latest stable release.
+///
+/// Default (no flag): project-local. Requires a `.cpm` at the project root;
+/// downloads CPM.cmake into `[paths] scripts` (as `CPM.cmake`).
+///
+/// `-g`/`--global`: bump the version pinned in this tool's own source tree
+/// (`src/get_cpm_default.cmake` + `DEFAULT_CPM_VERSION` in `src/config.rs`).
+pub fn update(global: bool, check: bool) -> Result<()> {
     let latest = latest_version()?;
+    if global {
+        update_self(&latest, check)
+    } else {
+        update_project(&latest, check)
+    }
+}
 
+/// `-g`: bump the version baked into the tool's own source tree.
+fn update_self(latest: &str, check: bool) -> Result<()> {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let default_cmake = repo.join("src").join("get_cpm_default.cmake");
     let config_rs = repo.join("src").join("config.rs");
 
     let d_src = std::fs::read_to_string(&default_cmake).with_context(|| {
         format!(
-            "cpm source not found under {} — run `cpm update` from a checkout",
+            "cpm source not found under {} — run `cpm update -g` from a checkout",
             repo.display()
         )
     })?;
@@ -104,17 +116,7 @@ pub fn update(check: bool) -> Result<()> {
         return Ok(());
     }
 
-    let url = format!(
-        "https://github.com/cpm-cmake/CPM.cmake/releases/download/v{latest}/CPM.cmake"
-    );
-    let tmp = config::tmp_dir()?;
-    std::fs::create_dir_all(&tmp)?;
-    let dst = tmp.join(format!("CPM_{latest}.cmake"));
-    println!("downloading CPM.cmake v{latest} ...");
-    download(&url, &dst)?;
-    let hash = crate::archive::sha256_file(&dst)?;
-    let _ = std::fs::remove_file(&dst);
-
+    let hash = download_cmake_to_tmp(latest)?;
     let d_new = d_src
         .replace(
             &format!("set(CPM_DOWNLOAD_VERSION {current})"),
@@ -138,6 +140,93 @@ pub fn update(check: bool) -> Result<()> {
     println!("  updated {}", config_rs.display());
     println!("rebuild (`cargo build --release`) and commit to finalize.");
     Ok(())
+}
+
+/// Default: refresh `<project>/[paths] scripts/CPM.cmake`.
+fn update_project(latest: &str, check: bool) -> Result<()> {
+    let root = config::find_project_root()?;
+    let cfg = config::load_project_config(&root)?;
+    let scripts_rel = cfg
+        .paths
+        .scripts
+        .as_deref()
+        .context("`.cpm` has no [paths] scripts")?;
+    let scripts = root.join(scripts_rel);
+    let cpm_cmake = scripts.join("CPM.cmake");
+
+    let current = std::fs::read_to_string(&cpm_cmake)
+        .ok()
+        .and_then(|s| detect_cpm_version(&s))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!("project : {}", root.display());
+
+    if check {
+        println!("scripts : {}", cpm_cmake.display());
+        println!("current : v{current}");
+        println!("latest  : v{latest}");
+        if latest == current {
+            println!("up to date");
+        } else {
+            println!("update available: {current} -> {latest}");
+        }
+        return Ok(());
+    }
+
+    if latest == current {
+        println!("Already at the latest stable release: CPM.cmake v{current}");
+        println!("  {}", cpm_cmake.display());
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&scripts)?;
+    let url = format!(
+        "https://github.com/cpm-cmake/CPM.cmake/releases/download/v{latest}/CPM.cmake"
+    );
+    println!("downloading {url}");
+    download(&url, &cpm_cmake)?;
+    let hash = crate::archive::sha256_file(&cpm_cmake)?;
+
+    println!("CPM.cmake {current} -> {latest} (sha256 {hash})");
+    println!("  written {}", cpm_cmake.display());
+    println!("commit to finalize.");
+    Ok(())
+}
+
+/// Download CPM.cmake for `version` into a temp file, return its sha256.
+fn download_cmake_to_tmp(version: &str) -> Result<String> {
+    let tmp = config::tmp_dir()?;
+    std::fs::create_dir_all(&tmp)?;
+    let dst = tmp.join(format!("CPM_{version}.cmake"));
+    let url = format!(
+        "https://github.com/cpm-cmake/CPM.cmake/releases/download/v{version}/CPM.cmake"
+    );
+    println!("downloading CPM.cmake v{version} ...");
+    download(&url, &dst)?;
+    let hash = crate::archive::sha256_file(&dst)?;
+    let _ = std::fs::remove_file(&dst);
+    Ok(hash)
+}
+
+/// Detect the release version baked into a CPM.cmake
+/// (`set(CURRENT_CPM_VERSION X.Y.Z)`), skipping the EXTRACTED_CPM_VERSION form.
+fn detect_cpm_version(content: &str) -> Option<String> {
+    let marker = "set(CURRENT_CPM_VERSION ";
+    let mut start = 0;
+    while let Some(rel) = content[start..].find(marker) {
+        let i = start + rel + marker.len();
+        let after = &content[i..];
+        let end = match after.find(|c: char| c == ')' || c.is_whitespace()) {
+            Some(e) => e,
+            None => break,
+        };
+        let v = &after[..end];
+        if v.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            return Some(v.to_string());
+        }
+        start = i;
+    }
+    None
 }
 
 /// Text between `marker` and the next `terminator` in `content`.

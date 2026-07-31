@@ -71,9 +71,12 @@ enum Cmd {
         #[arg(long)]
         latest: bool,
     },
-    /// Update the CPM.cmake bundled in this tool's source tree to the latest stable release.
+    /// Refresh the vendored CPM.cmake to the latest stable release.
     Update {
-        /// Show bundled vs latest without modifying anything.
+        /// Target this tool's own bundle instead of the current project.
+        #[arg(short, long)]
+        global: bool,
+        /// Show current vs latest without modifying anything.
         #[arg(long)]
         check: bool,
     },
@@ -93,6 +96,12 @@ enum Cmd {
         /// Module dir, relative to project root.
         #[arg(long, default_value = "build/cmake/modules/3rdparty")]
         dir: String,
+        /// Where the vendored CPM.cmake lives (relative to project root).
+        #[arg(long, default_value = "build/cmake/scripts")]
+        scripts: String,
+        /// Patch root (relative to project root).
+        #[arg(long, default_value = "build/patches")]
+        patches: String,
     },
     /// (Re)generate Find<Name>.cmake + fallback registrations from deps.toml.
     Generate {
@@ -131,10 +140,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::Fetch { force } => commands::fetch(force),
         Cmd::Show { name, hash } => commands::show(&name, hash),
         Cmd::Bootstrap { version, latest } => bootstrap::run(version.as_deref(), latest),
-        Cmd::Update { check } => bootstrap::update(check),
+        Cmd::Update { global, check } => bootstrap::update(global, check),
         Cmd::Env { export } => commands::env(export),
         Cmd::Verify { target } => commands::verify(&target),
-        Cmd::Init { project, dir } => gen::init(&project, &dir),
+        Cmd::Init { project, dir, scripts, patches } => {
+            gen::init(&project, &dir, &scripts, &patches)
+        }
         Cmd::Generate { project, dir } => gen::generate(&project, &dir),
     }
 }

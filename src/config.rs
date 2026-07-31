@@ -1,7 +1,7 @@
 //! Path resolution: separates archive storage ($CPM_PRELOAD) from the
 //! tool's own state ($CPM_HOME, defaults to XDG data dir).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -127,4 +127,46 @@ pub fn load_config() -> Config {
         return Config::default();
     };
     toml::from_str(&s).unwrap_or_default()
+}
+
+// ---- .cpm (per-repository project config) ----------------------------------
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ProjectConfig {
+    #[serde(default)]
+    pub paths: ProjectPaths,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[allow(dead_code)] // schema for upcoming commands (init/generate/preload)
+pub struct ProjectPaths {
+    /// Where the vendored CPM.cmake lives (relative to project root).
+    pub scripts: Option<String>,
+    /// Where deps.toml + engine + Find<Name>.cmake live.
+    pub module: Option<String>,
+    /// Patch root (→ CPM_PATCH_PREFIX).
+    pub patches: Option<String>,
+    /// Optional repo-local archive store.
+    pub preload: Option<String>,
+}
+
+/// Walk up from CWD to the nearest directory containing a `.cpm` file.
+pub fn find_project_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("cannot determine current directory")?;
+    for dir in cwd.ancestors() {
+        if dir.join(".cpm").is_file() {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    anyhow::bail!(
+        "no `.cpm` found here or in any parent — run from the root of a cpm project\n\
+         (create a `.cpm` with at least `[paths] scripts = \"...\"`)"
+    )
+}
+
+pub fn load_project_config(root: &Path) -> Result<ProjectConfig> {
+    let p = root.join(".cpm");
+    let s = std::fs::read_to_string(&p)
+        .with_context(|| format!("reading {}", p.display()))?;
+    toml::from_str(&s).with_context(|| format!("parsing {}", p.display()))
 }
