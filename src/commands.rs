@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::archive;
 use crate::config;
@@ -100,6 +100,23 @@ fn default_archive_name(name: &str, version: &str) -> String {
     format!("{}-{}.zip", name.to_ascii_lowercase(), version)
 }
 
+/// Parse `<name>-<version>.zip` into (lowercase name, verbatim version).
+/// Returns None unless a `-<digit>` boundary exists. Version is kept verbatim
+/// (no canonicalisation) so distinct packings (e.g. `3.4` vs `3.4.0.20251217`)
+/// don't collide.
+fn parse_archive_name_version(filename: &str) -> Option<(String, String)> {
+    let stem = filename.strip_suffix(".zip")?;
+    let bytes = stem.as_bytes();
+    let mut split = None;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            split = Some(i);
+        }
+    }
+    let i = split?;
+    Some((stem[..i].to_ascii_lowercase(), stem[i + 1..].to_string()))
+}
+
 fn human_bytes(b: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = b as f64;
@@ -177,18 +194,16 @@ pub fn add(
     // remove temp clone
     let _ = fs::remove_dir_all(&clone_dir);
 
-    reg.deps.insert(
-        name.to_string(),
-        Dep {
-            url: url.to_string(),
-            tag: tag.to_string(),
-            archive,
-            version: Some(version),
-            sha256: Some(sha),
-            added_at: Some(now_rfc3339()),
-            submodules: Some(has_submodules),
-        },
-    );
+    reg.upsert(Dep {
+        name: name.to_ascii_lowercase(),
+        url: Some(url.to_string()),
+        tag: Some(tag.to_string()),
+        archive,
+        version: Some(version),
+        sha256: Some(sha),
+        added_at: Some(now_rfc3339()),
+        submodules: Some(has_submodules),
+    });
     deps::save(&reg)?;
 
     println!(
@@ -215,23 +230,133 @@ pub fn fetch(force: bool) -> Result<()> {
         println!("(registry is empty; use `cpm add <name> <url> <tag>` first)");
         return Ok(());
     }
-    for (name, dep) in reg.deps.iter() {
+    for dep in &reg.deps {
+        let (url, tag) = match (dep.url.as_deref(), dep.tag.as_deref()) {
+            (Some(u), Some(t)) => (u.to_string(), t.to_string()),
+            _ => {
+                println!("skip {} ({}) — no source (loc-only)", dep.name, dep.archive);
+                continue;
+            }
+        };
         let path = config::preload_dir()?.join(&dep.archive);
         if path.exists() && !force {
-            println!("skip {} ({})", name, dep.archive);
+            println!("skip {} ({})", dep.name, dep.archive);
             continue;
         }
-        println!("==> {} @ {}", name, dep.tag);
+        println!("==> {} @ {}", dep.name, tag);
         add(
-            name,
-            &dep.url,
-            &dep.tag,
+            &dep.name,
+            &url,
+            &tag,
             Some(&dep.archive),
             dep.version.as_deref(),
-            git::looks_like_commit(&dep.tag),
+            git::looks_like_commit(&tag),
             true,
         )?;
     }
+    Ok(())
+}
+
+// ---- import ----------------------------------------------------------------
+
+/// Register archives already present in `$CPM_PRELOAD` into the pantry.
+///
+/// Default: trust the content — parse `<name>-<version>.zip`, compute sha256,
+/// register as loc-tier only (no source). `-f`: re-fetch from source; requires
+/// a pantry entry with url+tag, otherwise errors.
+pub fn import(force: bool) -> Result<()> {
+    config::ensure_dirs()?;
+    let preload = config::preload_dir()?;
+
+    let mut files: Vec<String> = fs::read_dir(&preload)?
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("zip") {
+                p.file_name()?.to_str().map(String::from)
+            } else {
+                None
+            }
+        })
+        .collect();
+    files.sort();
+
+    if force {
+        import_force(&files)
+    } else {
+        import_trust(&preload, &files)
+    }
+}
+
+fn import_trust(preload: &Path, files: &[String]) -> Result<()> {
+    let mut reg = deps::load()?;
+    let mut imported = 0u32;
+    let mut skipped = 0u32;
+    for fname in files {
+        let (name, version) = match parse_archive_name_version(fname) {
+            Some(nv) => nv,
+            None => {
+                println!("skip   {} (not <name>-<version>.zip)", fname);
+                skipped += 1;
+                continue;
+            }
+        };
+        let sha = archive::sha256_file(&preload.join(fname))?;
+        reg.upsert(Dep {
+            name,
+            url: None,
+            tag: None,
+            archive: fname.clone(),
+            version: Some(version),
+            sha256: Some(sha),
+            added_at: Some(now_rfc3339()),
+            submodules: None,
+        });
+        println!("added  {}", fname);
+        imported += 1;
+    }
+    deps::save(&reg)?;
+    println!("imported {} archive(s), skipped {}", imported, skipped);
+    Ok(())
+}
+
+fn import_force(files: &[String]) -> Result<()> {
+    let reg = deps::load()?;
+    let mut re_fetched = 0u32;
+    let mut unsourced: Vec<String> = Vec::new();
+    for fname in files {
+        let (name, version) = match parse_archive_name_version(fname) {
+            Some(nv) => nv,
+            None => continue,
+        };
+        match reg.pick(&name, Some(&version)) {
+            Some(d) if d.url.is_some() && d.tag.is_some() => {
+                let url = d.url.clone().unwrap();
+                let tag = d.tag.clone().unwrap();
+                println!("==> re-fetch {} {} from {}", name, version, url);
+                add(
+                    &name,
+                    &url,
+                    &tag,
+                    Some(fname),
+                    Some(&version),
+                    git::looks_like_commit(&tag),
+                    true,
+                )?;
+                re_fetched += 1;
+            }
+            _ => unsourced.push(fname.clone()),
+        }
+    }
+    if !unsourced.is_empty() {
+        bail!(
+            "no source to re-fetch for {} archive(s):\n  {}\n\
+             run `cpm import` without -f to trust them, or `cpm add <name> <url> <tag>` to add a source.",
+            unsourced.len(),
+            unsourced.join("\n  ")
+        );
+    }
+    println!("re-fetched {} archive(s)", re_fetched);
     Ok(())
 }
 
@@ -240,18 +365,29 @@ pub fn fetch(force: bool) -> Result<()> {
 pub fn list() -> Result<()> {
     let reg = deps::load()?;
     if reg.deps.is_empty() {
-        println!("(registry is empty; use `cpm add <name> <url> <tag>` first)");
+        println!("(registry is empty; use `cpm add` or `cpm import`)");
         return Ok(());
     }
     let preload = config::preload_dir_opt();
 
+    let mut entries: Vec<&Dep> = reg.deps.iter().collect();
+    entries.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| {
+                deps::version_key(b.version.as_deref().unwrap_or("0"))
+                    .cmp(&deps::version_key(a.version.as_deref().unwrap_or("0")))
+            })
+    });
+
     println!(
-        "{:<20} {:<12} {:<22} {:<10} {:<32} STATUS",
+        "{:<20} {:<14} {:<24} {:<10} {:<32} STATUS",
         "NAME", "VERSION", "TAG", "SIZE", "ARCHIVE"
     );
-    println!("{}", "-".repeat(110));
-    for (name, dep) in &reg.deps {
+    println!("{}", "-".repeat(114));
+    for dep in &entries {
         let version = dep.version.clone().unwrap_or_else(|| "-".into());
+        let tag = dep.tag.clone().unwrap_or_else(|| "-".into());
         let (size_str, status) = match &preload {
             Some(p) => {
                 let path = p.join(&dep.archive);
@@ -265,8 +401,8 @@ pub fn list() -> Result<()> {
             None => ("?".into(), "no CPM_PRELOAD".to_string()),
         };
         println!(
-            "{:<20} {:<12} {:<22} {:<10} {:<32} {}",
-            name, version, dep.tag, size_str, dep.archive, status
+            "{:<20} {:<14} {:<24} {:<10} {:<32} {}",
+            dep.name, version, tag, size_str, dep.archive, status
         );
     }
     Ok(())
@@ -276,16 +412,29 @@ pub fn list() -> Result<()> {
 
 pub fn show(name: &str, with_hash: bool) -> Result<()> {
     let reg = deps::load()?;
-    let dep = reg
-        .deps
-        .get(name)
-        .with_context(|| format!("unknown dep '{name}'"))?;
+    let all = reg.versions(name);
+    if all.is_empty() {
+        bail!("unknown dep '{name}'");
+    }
+    let dep = &all[0];
     let preload = config::preload_dir()?;
     let path = preload.join(&dep.archive);
     let size = fs::metadata(&path).map(|m| human_bytes(m.len())).ok();
-    let version = dep.version.clone().unwrap_or_else(|| dep.tag.clone());
+    let version = dep.version.clone().unwrap_or_else(|| "?".into());
+    let tag = dep.tag.clone().unwrap_or_else(|| "-".into());
 
-    println!("# {}   tag {}   ({}, {})", name, dep.tag, dep.archive, size.unwrap_or_else(|| "missing".into()));
+    if all.len() > 1 {
+        let vers: Vec<_> = all.iter().map(|d| d.version.clone().unwrap_or_else(|| "?".into())).collect();
+        println!("# {} versions: {} (showing {})", dep.name, vers.join(", "), version);
+    }
+    println!(
+        "# {}   version {}   tag {}   ({}, {})",
+        dep.name,
+        version,
+        tag,
+        dep.archive,
+        size.unwrap_or_else(|| "missing".into())
+    );
 
     println!("CPMAddPackage(");
     println!("  NAME {}", name);
@@ -382,12 +531,12 @@ pub fn verify(target: &str) -> Result<()> {
     // cross-check with registry if it was a dep name
     if let Some(stripped) = path.file_name().and_then(|s| s.to_str()) {
         let reg = deps::load()?;
-        for (name, dep) in &reg.deps {
+        for dep in &reg.deps {
             if dep.archive == stripped {
                 match &dep.sha256 {
-                    Some(s) if s == &sha => println!("registry: {} — hash matches", name),
-                    Some(_) => println!("registry: {} — HASH MISMATCH", name),
-                    None => println!("registry: {} (no stored hash)", name),
+                    Some(s) if s == &sha => println!("registry: {} — hash matches", dep.name),
+                    Some(_) => println!("registry: {} — HASH MISMATCH", dep.name),
+                    None => println!("registry: {} (no stored hash)", dep.name),
                 }
                 break;
             }
@@ -408,9 +557,9 @@ fn resolve_target(target: &str) -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    // try as a dep name in the registry
+    // try as a dep name in the registry (freshest version)
     let reg = deps::load()?;
-    if let Some(dep) = reg.deps.get(target) {
+    if let Some(dep) = reg.pick(target, None) {
         return Ok(config::preload_dir()?.join(&dep.archive));
     }
     Ok(as_path.to_path_buf())

@@ -258,7 +258,7 @@ pub fn generate(project: &str, rel: &str) -> Result<()> {
 
     for key in &keys {
         let spec = manifest.dep.get(key).cloned().unwrap_or_default();
-        let base = pantry.deps.get(key);
+        let base = pantry.pick(key, spec.version.as_deref());
 
         // valid if any source data is available: pantry entry, explicit source
         // list, no_source (synthetic), or a declared tarball/git url.
@@ -280,7 +280,7 @@ pub fn generate(project: &str, rel: &str) -> Result<()> {
             .clone()
             .or_else(|| base.and_then(|b| b.version.clone()))
             .or_else(|| spec.tag.clone())
-            .or_else(|| base.map(|b| b.tag.clone()));
+            .or_else(|| base.and_then(|b| b.tag.clone()));
 
         // package-level options (tokens)
         let mut pkg_opts: Vec<String> = Vec::new();
@@ -507,13 +507,13 @@ fn synthesize_candidates(
         .tag
         .as_ref()
         .map(|t| subst_version(t, version))
-        .or_else(|| base.map(|b| b.tag.clone()));
+        .or_else(|| base.and_then(|b| b.tag.clone()));
 
     let git_disabled = matches!(spec.git, Some(GitField::Bool(false)));
     let git_url = match &spec.git {
         Some(GitField::Url(u)) => Some(u.clone()),
         Some(GitField::Bool(false)) => None,
-        Some(GitField::Bool(true)) | None => base.map(|b| b.url.clone()),
+        Some(GitField::Bool(true)) | None => base.and_then(|b| b.url.clone()),
     };
 
     // tier: git

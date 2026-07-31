@@ -52,6 +52,12 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Register archives already in $CPM_PRELOAD into the pantry.
+    Import {
+        /// Re-fetch from source (requires url+tag in pantry; else errors).
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Print a ready-to-paste CPMAddPackage(...) snippet.
     Show {
         name: String,
@@ -136,6 +142,7 @@ fn main() -> anyhow::Result<()> {
         ),
         Cmd::List => commands::list(),
         Cmd::Fetch { force } => commands::fetch(force),
+        Cmd::Import { force } => commands::import(force),
         Cmd::Show { name, hash } => commands::show(&name, hash),
         Cmd::Bootstrap { version, latest } => bootstrap::run(version.as_deref(), latest),
         Cmd::Update { global, check } => bootstrap::update(global, check),
