@@ -135,6 +135,21 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rename a dependency in the global pantry (fix the canonical package name)
+    ///
+    /// Renames all versions of `old` (matched case-insensitively) to `new`. Use
+    /// this to correct the canonical CMake package name — e.g. you ran
+    /// `cpm add boost ...` but `find_package(Boost)` expects the canonical case.
+    /// Archive filenames stay lowercase, so a case-only rename (boost → Boost)
+    /// leaves the archives untouched; a real rename (boost → myboost) moves them.
+    /// After renaming, run `cpm generate` in your project(s) to refresh
+    /// `Find<Package>.cmake`.
+    Rename {
+        /// Current dependency name (matched case-insensitively).
+        old_name: String,
+        /// New canonical package name.
+        new_name: String,
+    },
     /// Print a ready-to-paste CPMAddPackage(...) snippet for a dependency
     ///
     /// Uses the freshest version. With --hash, includes a URL_HASH (SHA256) line.
@@ -212,6 +227,18 @@ enum Cmd {
     Verify {
         /// Dep name, archive filename, or path to a .zip.
         target: String,
+    },
+    /// Health check & cleanup for the CPM caches
+    ///
+    /// Scans $CPM_SOURCE_CACHE for empty directories left by failed/partial
+    /// extractions (these block re-extraction, since CPM sees the directory and
+    /// skips populating it) and removes them. Also verifies every registered
+    /// dependency's archive in $CPM_PRELOAD (presence + sha256). Use --dry-run to
+    /// preview without removing anything.
+    Doctor {
+        /// Report only; don't remove empty directories.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Initialize a cpm 3rdparty module in a project
     ///
@@ -384,6 +411,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Fetch { force } => commands::fetch(force),
         Cmd::Import { force } => commands::import(force),
         Cmd::Rm { name, version, dry_run } => commands::rm(&name, version.as_deref(), dry_run),
+        Cmd::Rename { old_name, new_name } => commands::rename(&old_name, &new_name),
         Cmd::Show { name, hash } => commands::show(&name, hash),
         Cmd::Info { name } => commands::info(&name),
         Cmd::Source { cmd } => match cmd {
@@ -396,6 +424,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Update { global, check } => bootstrap::update(global, check),
         Cmd::Env { export } => commands::env(export),
         Cmd::Verify { target } => commands::verify(&target),
+        Cmd::Doctor { dry_run } => commands::doctor(dry_run),
         Cmd::Init { project, dir, scripts, patches, force } => {
             gen::init(&project, &dir, &scripts, &patches, force)
         }

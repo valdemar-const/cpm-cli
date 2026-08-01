@@ -206,7 +206,7 @@ pub fn add(
                 if !attach_in_place(&mut reg, name, key, url, t, &sha) {
                     let submodules = existing.as_ref().and_then(|d| d.submodules);
                     reg.upsert(Dep {
-                        name: name.to_ascii_lowercase(),
+                        name: name.to_string(),
                         url: Some(url.to_string()),
                         tag: Some(t.to_string()),
                         archive: archive.clone(),
@@ -224,7 +224,7 @@ pub fn add(
             source::Kind::Fetch => {
                 if !has_entry {
                     reg.upsert(Dep {
-                        name: name.to_ascii_lowercase(),
+                        name: name.to_string(),
                         url: None,
                         tag: None,
                         archive: archive.clone(),
@@ -285,7 +285,7 @@ pub fn add(
         source::Kind::Fetch => (None, None),
     };
     reg.upsert(Dep {
-        name: name.to_ascii_lowercase(),
+        name: name.to_string(),
         url: surl,
         tag: stag,
         archive,
@@ -673,6 +673,96 @@ pub fn rm(name: &str, version: Option<&str>, dry_run: bool) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// `cpm rename <old> <new>` — rename a dependency in the global pantry.
+///
+/// Renames all versions of `old` (matched case-insensitively) to `new`. Use this
+/// to correct the canonical CMake package name (e.g. `cpm add boost` but
+/// `find_package(Boost)` expects canonical case). Archive filenames stay
+/// lowercase, so a case-only rename (boost → Boost) leaves archives untouched;
+/// a real rename (boost → myboost) moves the archive files.
+pub fn rename(old: &str, new: &str) -> Result<()> {
+    if old == new {
+        bail!("old and new name are identical");
+    }
+    let mut reg = deps::load()?;
+
+    // `new` must not collide with a *different* existing dependency.
+    let collision = reg
+        .deps
+        .iter()
+        .any(|d| d.name.eq_ignore_ascii_case(new) && !d.name.eq_ignore_ascii_case(old));
+    if collision {
+        bail!(
+            "cannot rename to '{new}': another dependency already uses that name (case-insensitive)"
+        );
+    }
+
+    // Archive moves: only for default-named archives whose lowercase stem changes.
+    // (A case-only rename keeps the same lowercase archive name → no file move.)
+    let mut moves: Vec<(String, String)> = Vec::new();
+    let mut count = 0usize;
+    for d in reg.deps.iter_mut() {
+        if !d.name.eq_ignore_ascii_case(old) {
+            continue;
+        }
+        if let Some(ver) = d.version.as_deref() {
+            let expected_old = default_archive_name(old, ver);
+            if d.archive == expected_old {
+                let expected_new = default_archive_name(new, ver);
+                if expected_new != expected_old {
+                    moves.push((d.archive.clone(), expected_new.clone()));
+                    d.archive = expected_new;
+                }
+            }
+        }
+        d.name = new.to_string();
+        count += 1;
+    }
+    if count == 0 {
+        bail!("no pantry entries match '{old}'");
+    }
+    deps::save(&reg)?;
+
+    println!(
+        "renamed {count} entr{}  '{old}' -> '{new}'",
+        if count == 1 { "y" } else { "ies" }
+    );
+    if moves.is_empty() {
+        println!("(archives unchanged — lowercase names are identical)");
+    } else {
+        let preload = config::preload_dir()?;
+        for (from, to) in &moves {
+            let from_path = preload.join(from);
+            let to_path = preload.join(to);
+            if from_path.exists() {
+                rename_case_safe(&from_path, &to_path)
+                    .with_context(|| format!("rename archive {from} -> {to}"))?;
+                println!("  archive: {from} -> {to}");
+            } else {
+                println!("  archive: {from} -> {to} (not in $CPM_PRELOAD; registry updated)");
+            }
+        }
+    }
+    println!("run `cpm generate` in your project(s) to refresh Find<Package>.cmake");
+    Ok(())
+}
+
+/// Rename a file, forcing the new on-disk case even on case-insensitive but
+/// case-preserving filesystems (NTFS), where a direct rename differing only in
+/// case is a no-op. Two-step via a temp name.
+fn rename_case_safe(from: &Path, to: &Path) -> Result<()> {
+    if !from.exists() {
+        return Ok(());
+    }
+    let tmp = from.with_extension("cpmrenametmp");
+    std::fs::rename(from, &tmp).with_context(|| format!("stage {}", from.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, to) {
+        let _ = std::fs::rename(&tmp, from); // best-effort restore
+        return Err(e).with_context(|| format!("rename -> {}", to.display()));
     }
     Ok(())
 }
@@ -1274,6 +1364,128 @@ fn resolve_target(target: &str) -> Result<PathBuf> {
         return Ok(config::preload_dir()?.join(&dep.archive));
     }
     Ok(as_path.to_path_buf())
+}
+
+// ---- doctor ----------------------------------------------------------------
+
+/// `cpm doctor` — health check & cleanup.
+///
+/// Removes empty directories from $CPM_SOURCE_CACHE (left by failed/partial
+/// extractions — these block re-extraction because CPM sees the dir and skips
+/// populating it) and verifies every registered dependency's archive in
+/// $CPM_PRELOAD (presence + sha256).
+pub fn doctor(dry_run: bool) -> Result<()> {
+    // ---- $CPM_SOURCE_CACHE: prune dead extractions ------------------------
+    match config::source_cache_opt() {
+        Some(cache) => {
+            println!("CPM_SOURCE_CACHE  {}", cache.display());
+            // CPM extracts each dependency to <cache>/<pkg>/<hash>/. A failed or
+            // partial extraction leaves <hash> with no files; CPM then sees the
+            // directory and skips re-populating it, so the dep stays broken until
+            // the dead <hash> is removed. Prune dead <hash> dirs (and a <pkg> dir
+            // left empty as a result). Internal empty subdirs of a POPULATED
+            // extraction (e.g. <hash>/.git/objects/info) are deliberately left
+            // untouched — they are not failed extractions.
+            let mut reports: Vec<String> = Vec::new();
+            let pkg_dirs = match fs::read_dir(&cache) {
+                Ok(it) => it.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)).collect::<Vec<_>>(),
+                Err(_) => Vec::new(),
+            };
+            for pkg in pkg_dirs {
+                let pkg_path = pkg.path();
+                let hash_dirs = match fs::read_dir(&pkg_path) {
+                    Ok(it) => it.flatten().filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)).collect::<Vec<_>>(),
+                    Err(_) => Vec::new(),
+                };
+                let mut live = false;
+                let mut dead_hashes: Vec<PathBuf> = Vec::new();
+                for hash in hash_dirs {
+                    let hpath = hash.path();
+                    let has_files = walkdir::WalkDir::new(&hpath).into_iter().flatten().any(|e| e.file_type().is_file());
+                    if has_files { live = true; } else { dead_hashes.push(hpath); }
+                }
+                if live {
+                    // populated extraction with some dead hash siblings → drop only those
+                    for h in &dead_hashes {
+                        let rel = h.strip_prefix(&cache).unwrap_or(h);
+                        if !dry_run { let _ = fs::remove_dir_all(h); }
+                        reports.push(format!("{} (dead extraction)", rel.display()));
+                    }
+                } else {
+                    // no live hash at all → the whole package dir is dead (failed
+                    // extraction(s), or an empty leftover like a stray <pkg>/)
+                    let pkg_has_files = walkdir::WalkDir::new(&pkg_path).into_iter().flatten().any(|e| e.file_type().is_file());
+                    if !pkg_has_files {
+                        let rel = pkg_path.strip_prefix(&cache).unwrap_or(&pkg_path);
+                        if !dry_run { let _ = fs::remove_dir_all(&pkg_path); }
+                        reports.push(format!("{} (dead package)", rel.display()));
+                    }
+                }
+            }
+            if reports.is_empty() {
+                println!("  no dead extraction directories (cache is clean)");
+            } else {
+                let verb = if dry_run { "would remove" } else { "removed" };
+                for r in &reports {
+                    println!("  {verb}  {r}");
+                }
+                let n = reports.len();
+                println!(
+                    "  {n} dead director{suffix} {action}",
+                    suffix = if n == 1 { "y" } else { "ies" },
+                    action = if dry_run { "found (dry-run)" } else { "pruned" }
+                );
+            }
+        }
+        None => println!("CPM_SOURCE_CACHE  (unset — set $CPM_SOURCE_CACHE to enable)"),
+    }
+
+    // ---- $CPM_PRELOAD: verify registered deps' archives --------------------
+    let reg = deps::load()?;
+    match config::preload_dir_opt() {
+        Some(pre) => {
+            println!("CPM_PRELOAD        {}", pre.display());
+            let mut seen = std::collections::HashSet::new();
+            let (mut ok, mut missing, mut bad) = (0usize, 0usize, 0usize);
+            for d in &reg.deps {
+                if !seen.insert(d.archive.clone()) {
+                    continue;
+                }
+                let p = pre.join(&d.archive);
+                if !p.exists() {
+                    println!("  {:<16} MISSING archive {}", d.name, d.archive);
+                    missing += 1;
+                } else if let Some(sha) = d.sha256.as_deref() {
+                    match archive::sha256_file(&p) {
+                        Ok(actual) if actual == sha => ok += 1,
+                        Ok(actual) => {
+                            println!(
+                                "  {:<16} HASH MISMATCH {} (expected {}.., got {}..)",
+                                d.name,
+                                d.archive,
+                                &sha.get(..8).unwrap_or(sha),
+                                &actual.get(..8).unwrap_or(&actual)
+                            );
+                            bad += 1;
+                        }
+                        Err(e) => {
+                            println!("  {:<16} cannot read {}: {}", d.name, d.archive, e);
+                            bad += 1;
+                        }
+                    }
+                } else {
+                    ok += 1; // present, no recorded hash to check
+                }
+            }
+            let n = reg.deps.len();
+            println!(
+                "  {n} registered archive{suffix}: {ok} ok, {missing} missing, {bad} hash-mismatch",
+                suffix = if n == 1 { "" } else { "s" }
+            );
+        }
+        None => println!("CPM_PRELOAD        (unset)"),
+    }
+    Ok(())
 }
 
 // ---- env -------------------------------------------------------------------

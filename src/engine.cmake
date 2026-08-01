@@ -136,19 +136,15 @@ function(cpm_resolve_fallback key)
       elseif(_tier STREQUAL "loc")
         if(EXISTS "${_url}")
           message(STATUS "cpm/fallback[${_pkg}] local: ${_url}")
-          # Build a valid file:// URL. Windows drive-letter paths (C:/...) need an
-          # extra leading slash -> file:///C:/... ; Unix paths already start with /
-          # so file://${_url} is already file:///home/...
-          if("${_url}" MATCHES "^([a-zA-Z]):[\\/]")
-            set(_loc_url "file:///${_url}")
-          else()
-            set(_loc_url "file://${_url}")
-          endif()
-          list(APPEND _args URL "${_loc_url}")
-          unset(_loc_url)
-          if(NOT (_hash STREQUAL ""))
-            list(APPEND _args URL_HASH "${_hash}")
-          endif()
+          # Pass the archive path verbatim — it is already a forward-slash CMake
+          # path (CPM_PRELOAD is normalised via file(TO_CMAKE_PATH)). A bare local
+          # path is exactly what CPMAddPackage/FetchContent expect on every
+          # platform. NB: URL_HASH is deliberately NOT forwarded here — on Windows
+          # (cmake 4.x) a bare drive-letter path WITH URL_HASH makes FetchContent
+          # take its verify/download path, which mangles the drive-letter path and
+          # fails. Integrity of the preloaded archive is checked by
+          # `cpm doctor` / `cpm verify` instead.
+          list(APPEND _args URL "${_url}")
           set(_try TRUE)
         endif()
       endif()
